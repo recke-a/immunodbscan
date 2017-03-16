@@ -2,6 +2,7 @@
 // Es sollen verschiedene Methoden untersucht werden.
 
 #include <iostream>
+#include <math.h>
 #include <thrust/device_vector.h>
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
@@ -66,6 +67,7 @@ __global__ void search_kernel_2(thrust::device_vector<bool>::iterator input_list
 	} 
 }
 
+
 int main()
 {
 	const int N=100000;
@@ -99,8 +101,8 @@ int main()
 	// cudaMemcpy(&ergebnis, thrust::raw_pointer_cast(dp_result),  sizeof(int), cudaMemcpyDeviceToHost);
 	ergebnis = *dp_result;
 	int ueberfluessig = *dp_ueberfluessig;
-	thrust::device_free(dp_result);
-	thrust::device_free(dp_ueberfluessig);
+	//thrust::device_free(dp_result);
+	//thrust::device_free(dp_ueberfluessig);
 	// finito
 	t2 = std::chrono::high_resolution_clock::now();
 	time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
@@ -108,9 +110,7 @@ int main()
     std::cout << "Ergebnis = " << ergebnis << "\n";	
     std::cout << "Insgesamt ueberfluessig = " << ueberfluessig << "\n";	
 	
-	
-
-	    
+	   
 	
 	return 0;
 }
