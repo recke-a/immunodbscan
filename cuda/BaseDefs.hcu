@@ -1,0 +1,9 @@
+#pragma once
+#include <iostream>
+
+#define REPORT { std::cout << "In function " << __FUNCTION__ << " - Line " << __LINE__ << " in file " << __FILE__ << "\n"; std::cout.flush(); }
+
+#define STATIC_CHECK(expr) { char unnamed[(expr) ? 1 : 0]; }
+
+ 
+#define MAXPARALLEL 4 

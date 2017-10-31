@@ -1,0 +1,137 @@
+/*
+ * DataContainer.hpp
+ * 
+ * Copyright 2017 Andreas Recke <andreas@AntigoneLinux>
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+ 
+ #pragma once
+ #include "BaseDefs.hcu"
+ #include "CudaDefinitions.hcu"
+ #include "BitsetVector.hcu"
+ #include "StringOperations.hcu"
+ #include <thrust/tuple.h>
+ #include <thrust/iterator/zip_iterator.h>
+
+#include <cstddef>		
+#include <string>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/functional.h>
+#include <thrust/tuple.h>
+#include <thrust/transform.h>	
+
+
+//************************************************************************************************
+
+
+// This is just a base class that is used to define a pointer to any kind of DataManagementClass instantiation
+
+struct DataManagementBase
+{
+	typedef int GuyFawkesType;
+};
+
+
+// This class is just to manage operations for searching of entries
+// It works on iterators
+// And it provides a type cloning system
+
+ 
+template <class ZippedBitsetIteratorType, class ZippedBitsetPropertiesType, class ZippedStringIteratorType, class CopiesIteratorType>
+class DataManagementClass : public DataManagementBase
+{
+	
+	unsigned int n_entries;
+	ZippedBitsetPropertiesType 	BitsetProperties;
+	CopiesIteratorType         	CopiesIterator;
+	ZippedBitsetIteratorType	BitsetDataIterator;
+	ZippedStringIteratorType	StringDataIterator;
+	unsigned int max_strlen;
+	
+	public:
+		
+	using proxyZippedBitsetIteratorType = ZippedBitsetIteratorType;
+	using proxyZippedBitsetPropertiesType = ZippedBitsetPropertiesType;
+	using proxyZippedStringIteratorType = ZippedStringIteratorType;
+	using proxyCopiesIteratorType = CopiesIteratorType;
+		
+		
+	// constructor
+	DataManagementClass( ZippedBitsetIteratorType _BitsetDataIterator, 
+				   ZippedBitsetPropertiesType _BitsetProperties, 
+				   ZippedStringIteratorType _StringDataIterator, 
+				   CopiesIteratorType _CopiesIterator, 
+				   unsigned int _n_entries, 
+				   unsigned int _max_strlen 
+				  ) :
+			n_entries(_n_entries),
+			BitsetProperties(_BitsetProperties),
+			CopiesIterator(_CopiesIterator),
+			BitsetDataIterator(_BitsetDataIterator),
+			StringDataIterator(_StringDataIterator),
+			max_strlen(_max_strlen)
+	{	
+		_USAGE				
+	}
+		
+	// create empty class	
+	DataManagementClass()
+	{
+	}
+		
+		
+	//*****************
+				
+	unsigned int get_n_entries()
+	{
+		return n_entries;
+	}
+	
+	ZippedBitsetPropertiesType get_bitset_properties()
+	{
+		return BitsetProperties;
+	}
+	
+	CopiesIteratorType get_copies_iterator()
+	{
+		return CopiesIterator;
+	}
+	
+	ZippedBitsetIteratorType get_bitset_begin()
+	{
+		return BitsetDataIterator;
+	}
+	
+	
+	ZippedStringIteratorType get_StringDataIterator()
+	{
+		return StringDataIterator;
+	}
+	
+	unsigned int get_max_strlen()
+	{
+		return max_strlen;
+	}
+		
+};
+
+
+	
+

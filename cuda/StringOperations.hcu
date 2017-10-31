@@ -1,0 +1,145 @@
+/*
+ * StringsOperations.hpp
+ * 
+ * Copyright 2017 Andreas Recke <andreas@AntigoneLinux>
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+
+// This program part defines a strided stringset and the kernel for comparison as well as translation of DNA into amino acid codes
+
+#pragma once
+#include <cstddef>
+#include "CudaDefinitions.hcu"
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <string>
+#include <vector>
+#include <thrust/functional.h>
+#include <thrust/reduce.h>
+#include <thrust/copy.h>
+#include <thrust/iterator/counting_iterator.h>
+
+
+
+template <class InputStringsIteratorType>			
+class StringSet
+{
+	private:
+	// this class stores and works on the strings
+	thrust::device_vector<char>  Strings;    // the data 
+	thrust::device_vector<unsigned int> StringLengths;
+	thrust::device_vector<unsigned int> StringOffsets;
+	thrust::device_vector<unsigned int> StringHashes;
+	
+	unsigned int n_entries;
+	unsigned int width;            // the maximum strlen
+	unsigned int total_length;
+
+	//************ a local class *********************************************************
+	
+	struct str_len_functor : public thrust::unary_function< std::string, unsigned int>
+	{
+		__host__ unsigned int operator()(std::string x)
+		{
+			return x.size();
+		}
+	};
+
+	//**************************************************************************************
+		
+	public:
+	
+	typedef thrust::zip_iterator<thrust::tuple<thrust::permutation_iterator<thrust::device_vector<char>::iterator, thrust::device_vector<unsigned int>::iterator >, 
+		thrust::device_vector<unsigned int>::iterator, thrust::device_vector<unsigned int>::iterator > > StringSetIteratorType;
+	
+	// take up data
+	
+	StringSet(InputStringsIteratorType inputStringsIterator, unsigned int _n_elements) :
+	  StringLengths(_n_elements),
+	  StringOffsets(_n_elements),
+	  StringHashes(_n_elements),
+	  Strings(_n_elements),
+	  n_entries(_n_elements)
+	{
+		thrust::host_vector<unsigned int> hv(_n_elements);
+		thrust::transform(inputStringsIterator, inputStringsIterator + _n_elements, hv.begin(), str_len_functor());
+		thrust::copy(hv.begin(), hv.end(), StringLengths.begin());
+		// find maximum string length
+		width = thrust::reduce(thrust::device, StringLengths.begin(), StringLengths.end(), 0u, thrust::maximum<unsigned int>());
+		
+		// determine the sum of lengths of strings
+		total_length = thrust::reduce(thrust::device, StringLengths.begin(), StringLengths.end(), 0u, thrust::plus<unsigned int>());
+		
+		// calculated hashes
+		std::hash<std::string> hash_fn;
+		thrust::transform(inputStringsIterator, inputStringsIterator + _n_elements, hv.begin(), [&](const std::string& to_hash) { return static_cast<unsigned int>(hash_fn(to_hash)); });
+		thrust::copy(hv.begin(), hv.end(), StringHashes.begin());
+		
+		// allocate Container and init with zero
+		thrust::host_vector<char> temp_strings(total_length, 0);
+		
+		thrust::exclusive_scan(thrust::device, StringLengths.begin(), StringLengths.end(), StringOffsets.begin(), 0u);
+		
+		// and copy data
+		unsigned position = 0;
+		for (auto s_it = inputStringsIterator; s_it != inputStringsIterator + _n_elements; position += (*s_it).length(), ++s_it ) 
+		{
+		    thrust::copy( (*s_it).begin(), (*s_it).end(), temp_strings.begin() + position);
+		}
+		
+	    Strings    = thrust::device_vector<char> (temp_strings.begin(), temp_strings.end());  // mal sehen!
+	    
+	 //   std::cout << "\nPeek:<"; std::cout.flush();	
+	  //  for (auto it = temp_strings.begin(); it != temp_strings.begin() + 500; ++it) std::cout << ( (*it != 0)? (*it) : ' ' );
+	  //  std::cout << ">\n"; std::cout.flush();	
+	    
+	}
+	
+		
+		
+	StringSetIteratorType StringSet_begin()
+	{
+		return thrust::make_zip_iterator(
+		thrust::make_tuple(
+			thrust::make_permutation_iterator(Strings.begin(), StringOffsets.begin()),
+			StringLengths.begin(),
+			StringHashes.begin()
+		));
+	}
+
+	unsigned int get_max_strlen() 
+	{
+		return width;
+	}
+	
+	unsigned int n_elements()
+	{
+		return n_entries;
+	}
+};
+
+
+template <class InputStringsIteratorType> StringSet<InputStringsIteratorType> make_stringset(InputStringsIteratorType inputStringsIterator, unsigned int _n_elements)
+{
+	return StringSet<InputStringsIteratorType>(inputStringsIterator, _n_elements);
+}

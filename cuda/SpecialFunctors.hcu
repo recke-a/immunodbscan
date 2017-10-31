@@ -1,0 +1,346 @@
+/*
+ * SpecialFunctors.hpp
+ * 
+ * Copyright 2017 Andreas Recke <andreas@AntigoneLinux>
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+
+#pragma once
+#include<thrust/iterator/zip_iterator.h>
+#include<thrust/iterator/transform_iterator.h>
+#include<thrust/tuple.h>
+#include<thrust/functional.h>
+
+
+//******************************************************************************************
+// Some classes to map integral constants to types
+
+struct running_type {};
+struct final_type {};
+	
+template <int v>
+struct Int2Type {
+	enum { value = v };
+	typedef running_type checking_type;
+	typedef Int2Type<v-1> Int2TypeLower;
+};
+
+template <>
+struct Int2Type<0> {
+	enum { value = 0 };
+	typedef final_type checking_type;
+};
+
+template <bool b>
+struct Bool2Type
+{
+	enum {logical_value = b};
+};
+
+
+template <bool, class T = void> 
+struct enable_if 
+{};
+
+template <class T> 
+struct enable_if<true, T> 
+{ 
+  typedef T type; 
+};
+
+
+//******************************************************************************************
+// This functor is useful to define a transformation iterator which checks whether the
+// value of the iterator is equal to a pre-set value
+
+template<typename ArgumentType, typename OutputType = int>
+struct equal_to_value_op : public thrust::unary_function<ArgumentType, OutputType>
+{
+	private:
+	ArgumentType comp_value;
+	
+	public:
+	equal_to_value_op(ArgumentType _comp) : comp_value(_comp) {}
+	
+	__host__ __device__
+	OutputType operator()(ArgumentType arg)
+	{
+		return arg == comp_value;
+	}
+	
+};
+
+//******************************************************************************************
+// This functor is useful to define a transformation iterator which checks whether the
+// value of the iterator is equal to a pre-set value
+
+template<typename ArgumentType, typename OutputType = int>
+struct larger_or_equal_to_value_op : public thrust::unary_function<ArgumentType, OutputType>
+{
+	private:
+	ArgumentType comp_value;
+	
+	public:
+	larger_or_equal_to_value_op(ArgumentType _comp) : comp_value(_comp) {}
+	
+	__host__ __device__
+	OutputType operator()(ArgumentType arg)
+	{
+		return arg >= comp_value;
+	}
+	
+};
+
+//******************************************************************************************
+// This functor is to scramble data access and distribute it evenly across different 
+// streams, to avoid collision
+
+struct scrambler_functor : public thrust::unary_function<unsigned int, unsigned int>
+{
+	unsigned int current_offset, parallel, max_index;
+	
+	scrambler_functor(unsigned int _current_offset, unsigned int _parallel, unsigned int _max_index) : 
+		current_offset(_current_offset),
+		max_index(_max_index), 
+		parallel(_parallel) {}
+	
+	
+	__host__ __device__
+	unsigned int operator()(unsigned int arg)
+	{
+		return ((arg*parallel + current_offset + (arg*parallel)/max_index)) % max_index;
+	}
+	
+};
+
+//******************************************************************************************
+// This is just a nice functor to avoid complicated coding
+
+
+template <typename logical_type>
+struct a_and_not_b_functor : public thrust::binary_function<logical_type, logical_type, logical_type>
+{
+	__host__ __device__
+	logical_type operator()(logical_type a, logical_type b)
+	{
+		return a && (!b);
+	}
+};
+
+
+
+//******************************************************************************************
+// This functor just determines whether a certain point has enough neighbours to be a 
+// core point.
+// It allows either bool or int to be the output
+
+template <typename output_type>
+struct is_core_point_functor : public thrust::unary_function<unsigned int, output_type>
+{
+	unsigned int minPts;
+	
+	is_core_point_functor(unsigned int _minPts) : minPts(_minPts) {}
+	
+	__host__ __device__
+	output_type operator()(unsigned int arg)
+	{
+		return arg >= minPts;
+	}
+};
+
+//******************************************************************************************
+// This simple functor substracts one from a given value
+template <typename ArgumentType>
+struct minus_1_functor : public thrust::unary_function<ArgumentType, ArgumentType>
+{
+	__host__ __device__
+	ArgumentType operator()(ArgumentType arg)
+	{
+		return arg - 1;
+	}
+};
+
+
+//******************************************************************************************
+// For a special iterator function, I need a functor that makes a unary operation
+// on two zipped arrays from a binary operation
+
+template <typename BinaryFunctionType>
+struct binary_to_zipped_unary_function : 
+	public thrust::unary_function<thrust::tuple<typename BinaryFunctionType::first_argument_type, typename BinaryFunctionType::second_argument_type>, typename BinaryFunctionType::result_type>
+	//,
+	// private BinaryFunctionType
+{
+	
+	using result_type = typename BinaryFunctionType::result_type;
+	using argument_type = thrust::tuple<typename BinaryFunctionType::first_argument_type,  typename BinaryFunctionType::second_argument_type>;
+		
+	__host__ __device__
+	result_type operator()(const argument_type& arg) const
+	{
+		BinaryFunctionType op;
+		return op(thrust::get<0>(arg), thrust::get<1>(arg));
+	}
+};
+
+
+
+
+//**************************  some general service functions ************************************************
+
+template <typename T> __host__ __device__ T maximum(T a, T b)
+{
+	return (a>b)? a : b;
+}
+
+template <typename T> __host__ __device__ T minimum(T a, T b)
+{
+	return (a<b)? a : b;
+}
+	
+	
+		
+//******************************************************************************************
+// The following three functors are needed to encapsulate the distance threshold for
+// the FM-DBSCAN procedure. Because we are working with relative Levenshtein distances
+// that are dependend on the string length, this is a bit tricky, and best implemented
+// using these functors.
+// All functors take up the lengths of the two strings that are compared.
+
+// This is the direct connection
+
+struct epsilonOneFunctorClassDummy 
+{
+	private:
+	float threshold;
+	
+	public:
+	epsilonOneFunctorClassDummy(float _threshold) : threshold(_threshold) {}
+	
+	__host__ __device__ int operator()(unsigned int query_len, unsigned int subj_len)
+	{
+		return (query_len > subj_len)? (query_len - subj_len) : (subj_len - query_len); 
+	}
+	
+};
+
+
+
+template<bool useHamming=false>
+struct epsilonOneFunctorClass
+{
+	private:
+	float threshold;
+	
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<true>)
+	{
+		int fschwelle = truncf(float(query_len) * threshold);
+		return fschwelle;
+	}
+		
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<false>)
+	{
+		float fschwelle = truncf(maximum(float(query_len), float(subj_len)) * threshold);
+		return fschwelle;
+	}	
+		
+		
+	public:
+	
+		
+	epsilonOneFunctorClass(float _threshold) : threshold(_threshold) {}
+	
+	__host__ __device__ int operator()(unsigned int query_len, unsigned int subj_len)
+	{
+		Bool2Type<useHamming> tag;
+		return distance_value(query_len, subj_len, tag);
+	}
+};
+
+// This is the connection with one unknown string in the middle
+template<bool useHamming=false>
+struct epsilonTwoFunctorClass
+{
+	private:
+	float threshold;
+	
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<true>)
+	{
+		int fschwelle = truncf(float(query_len) * threshold * 2);
+		return fschwelle;
+	}
+		
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<false>)
+	{
+		float inter_b_len = minimum(float(query_len)/(1.0f - threshold), float(subj_len)/(1.0f - threshold));
+		float fschwelle = truncf(( maximum(float(query_len), inter_b_len) + maximum(inter_b_len, float(subj_len)) ) * threshold);
+		return fschwelle;
+	}	
+		
+		
+	public:
+	
+		
+	epsilonTwoFunctorClass(float _threshold) : threshold(_threshold) {}
+	
+	__host__ __device__ int operator()(unsigned int query_len, unsigned int subj_len)
+	{
+		Bool2Type<useHamming> tag;
+		return distance_value(query_len, subj_len, tag);
+	}
+};
+
+
+
+// This is the connection with two unknown strings between the two compared strings
+template<bool useHamming=false>
+struct epsilonThreeFunctorClass
+{
+	private:
+	float threshold;
+	
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<true>)
+	{
+		int fschwelle = truncf(float(query_len) * threshold * 3);
+		return fschwelle;
+	}
+		
+	__host__ __device__ int distance_value(unsigned int query_len, unsigned int subj_len, Bool2Type<false>)
+	{
+		float inter_b_len = minimum(float(query_len)/(1.0f - threshold), float(subj_len)/(1.0f - threshold)/(1.0f - threshold));
+        float inter_c_len = minimum(float(subj_len)/(1.0f - threshold), float(query_len)/(1.0f - threshold)/(1.0f - threshold));
+			            			            
+		float fschwelle = truncf((maximum(float(query_len), inter_b_len) + maximum(inter_c_len, inter_b_len) + maximum(float(subj_len), inter_c_len))*threshold);
+		return fschwelle;
+	}
+		
+		
+	public:
+	
+		
+	epsilonThreeFunctorClass(float _threshold) : threshold(_threshold) {}
+	
+	__host__ __device__ int operator()(unsigned int query_len, unsigned int subj_len)
+	{
+		Bool2Type<useHamming> tag;
+		return distance_value(query_len, subj_len, tag);
+	}
+};
+
+

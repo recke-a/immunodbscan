@@ -1,0 +1,174 @@
+/*
+ * SpecialIterators.hpp
+ * 
+ * Copyright 2017 Andreas Recke <andreas@AntigoneLinux>
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+
+#pragma once
+#include <thrust/iterator/iterator_adaptor.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/functional.h>
+#include "SpecialFunctors.hcu"
+
+//************************************************************************************************************************
+
+// derive jumping iterator from iterator_adaptor
+template<typename Iterator>
+  class jumping_iterator
+    : public thrust::iterator_adaptor< jumping_iterator<Iterator>, Iterator >
+{
+  public:
+    typedef thrust::iterator_adaptor<
+      jumping_iterator<Iterator>,
+      Iterator
+    > super_t;
+      
+    __host__ __device__
+    jumping_iterator(const Iterator &x, int n) : super_t(x), begin(x), n(n) {}
+    
+    friend class thrust::iterator_core_access;
+        
+  private:
+    // repeat each element of the adapted range after n steps
+    unsigned int n;
+    
+    const Iterator begin;   // make it non-const!!
+    
+    __host__ __device__
+    typename super_t::reference dereference() const
+    {
+      return *(begin + (this->base() - begin) * n);
+    }
+};
+
+//************************************************************************************************************************
+
+
+// derive repeat_iterator from iterator_adaptor
+template<typename Iterator>
+  class repeat_iterator
+    : public thrust::iterator_adaptor< repeat_iterator<Iterator>, Iterator >
+{
+  public:
+    typedef thrust::iterator_adaptor<
+      repeat_iterator<Iterator>,
+      Iterator
+    > super_t;
+    __host__ __device__
+    repeat_iterator(const Iterator &x, int n) : super_t(x), begin(x), n(n) {}
+    
+    friend class thrust::iterator_core_access;
+   
+    
+  private:
+    // repeat each element of the adapted range after n steps
+    unsigned int n;
+    
+    const Iterator begin;
+    
+    __host__ __device__
+    typename super_t::reference dereference() const
+    {
+      return *(begin + (this->base() - begin) % n);
+    }
+};
+
+
+//************************************************************************************************************************
+
+template <typename InputIteratorType1, typename InputIteratorType2, typename BinaryFunctionType>
+thrust::transform_iterator< 
+		binary_to_zipped_unary_function<BinaryFunctionType>,
+		thrust::zip_iterator< thrust::tuple < InputIteratorType1, InputIteratorType2 > > >			
+make_dual_transform_iterator(InputIteratorType1 InputIterator1, InputIteratorType2 InputIterator2, BinaryFunctionType BinaryFunction)
+{
+	return thrust::make_transform_iterator(
+		thrust::make_zip_iterator(
+			thrust::make_tuple(InputIterator1, InputIterator2)
+		), 
+		binary_to_zipped_unary_function<BinaryFunctionType>()
+	);
+}
+
+
+//***************************************************************************************************************************
+// Some class definitions to re-construct a tuple from another tuple
+
+
+template<int N, class ElementType> struct tuple_redefinition_type;
+
+template<class ElementType> 
+struct tuple_redefinition_type<1, ElementType>
+{
+	typedef thrust::tuple<ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<2, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<3, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<4, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<5, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<6, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<7, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<8, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType> type;
+};
+
+template<class ElementType> 
+struct tuple_redefinition_type<9, ElementType>
+{
+	typedef thrust::tuple<ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType, ElementType> type;
+};

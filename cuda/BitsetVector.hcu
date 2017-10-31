@@ -1,0 +1,92 @@
+
+#pragma once
+#include <string>
+#include <vector>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/iterator/iterator_adaptor.h>
+#include <thrust/tuple.h>
+#include "SpecialIterators.hcu"
+#include "SpecialFunctors.hcu"
+#include "StringOperations.hcu"
+
+//************************************************************************************************************************
+
+// template <class InputStringsIteratorType1, class InputStringsIteratorType2>	
+class bitset_container
+{
+	public:
+	typedef thrust::device_vector<int> container_type;
+	typedef container_type::iterator iterator_type;
+	
+	private:
+		
+	container_type container;
+    unsigned int n_entries;     // neu
+    unsigned int bit_width;     // neu
+    unsigned int bit_wordsize;  // neu
+
+      
+    unsigned int get_offset(unsigned int xth_bit); // neu
+	unsigned int get_bitposition(unsigned int xth_bit);	// neu	
+    
+    public: 
+    
+    template <class InputStringsIteratorType1, class InputStringsIteratorType2>	
+    bitset_container(InputStringsIteratorType1 gene_vector_iter, InputStringsIteratorType2 gene_reference, unsigned int n_entries, unsigned int n_genes);  // neu
+    bitset_container(unsigned int _n_entries, unsigned int _bit_width);
+	bitset_container() {}  // does nothing
+
+    
+    typedef jumping_iterator<iterator_type> entry_iterator_type;
+    
+    entry_iterator_type begin_bitset(); // neu
+    
+    container_type::iterator begin_container() 
+    {
+		return container.begin();
+	}
+    
+    container_type::iterator end_container() 
+    {
+		return container.end();
+	}
+    
+    template <class StringSetIteratorType>
+    void walk_queries( // typename StringSet<InputStringsIteratorType1>::
+					   StringSetIteratorType StringListIterator,
+					   const std::string& querystring, 
+					   unsigned int max_strlen, 
+                       unsigned int xth_bit);
+    
+   
+    unsigned int get_width();
+    unsigned int get_element_count();
+    
+    // testing functions
+    thrust::host_vector<unsigned int> get_equivalent_entry_indices(unsigned int query_index);
+    void get_equivalent_entries_with_mask(unsigned int query_index, thrust::device_vector<bool>& mask_vector);
+    void get_identical_entries_with_mask(unsigned int query_index, thrust::device_vector<bool>& mask_vector);
+    
+    void example();
+    void print_example_entry(unsigned int entry_index);
+    
+    void erase(entry_iterator_type from, entry_iterator_type to);
+      
+};  
+	
+/*	
+template <class InputStringsIteratorType1, class InputStringsIteratorType2>	
+bitset_container<InputStringsIteratorType1,InputStringsIteratorType2> 
+make_bitset_container(InputStringsIteratorType1 gene_vector_iter, InputStringsIteratorType2 gene_reference, unsigned int n_entries, unsigned int n_genes)
+{
+	return bitset_container<InputStringsIteratorType1, InputStringsIteratorType2>(gene_vector_iter, gene_reference, n_entries, n_genes);
+}
+*/
+
+
+// Another function encapsulated here only for CUDA
+
+    #include "BitsetVector.inl"
+    
+    

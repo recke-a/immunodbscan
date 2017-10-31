@@ -1,0 +1,1214 @@
+/*
+ * DBSCAN.hpp
+ * 
+ * Copyright 2017 Andreas Recke <andreas@AntigoneLinux>
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+ 
+#include <iostream>
+#include <cassert>
+
+#include "../cpp/BenchmarkSingleton.hpp"
+
+#include <thrust/device_vector.h>
+#include <thrust/functional.h>
+#include <thrust/execution_policy.h>
+
+#include <thrust/sequence.h>
+#include <thrust/scatter.h>
+#include <thrust/gather.h>
+
+#include <thrust/fill.h>
+#include <thrust/unique.h>
+#include <thrust/copy.h> 
+#include <thrust/reduce.h> 
+#include <thrust/transform.h> 
+#include <thrust/replace.h> 
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/inner_product.h>
+#include "SpecialFunctors.hcu"
+#include "SpecialIterators.hcu"
+ 
+ 
+//*** some kernels for this method ************************************************************************
+
+//*********************************************************************************************************
+// this device function looks for the root of an entry and sets it to a new position
+/* halving */
+template <typename root_iterator_type>
+__device__
+void set_new_root(root_iterator_type roots_iter, unsigned int entry, unsigned int new_root)
+{
+	using root_value_type = typename root_iterator_type::value_type;
+	static_assert(std::is_same<root_value_type, unsigned int>::value, "Root iterator has not value type unsigned int");
+	
+	unsigned int cur;
+	unsigned int next = entry;
+	do 
+	{
+		cur = next;
+		next = atomicExch( thrust::raw_pointer_cast(& (* (roots_iter + cur))), new_root );
+	} while (next != cur);
+	
+}
+
+template <typename root_iterator_type>
+__device__
+void union_a_and_b(root_iterator_type roots_iter, unsigned int point_a, unsigned int point_b)
+{
+	using root_value_type = typename root_iterator_type::value_type;
+	static_assert(std::is_same<root_value_type, unsigned int>::value, "Root iterator has not value type unsigned int");
+	
+	unsigned int cur, next, new_root;
+	
+	next     = (point_a > point_b)? point_a : point_b;
+	new_root = (point_a > point_b)? point_b : point_a;
+	
+	/*
+	 // not useful
+	cur = *(roots_iter + new_root);
+	while (cur != new_root)
+	{
+		cur = new_root;
+		new_root = *(roots_iter + new_root);
+	}
+	*/
+	
+	bool success;
+	do	
+	{
+		cur = next;
+		next = atomicExch( thrust::raw_pointer_cast(& (* (roots_iter + cur))), new_root );
+			success = (cur == next) || (next == new_root);	
+		if (new_root > next) thrust::swap(next, new_root);
+	} 
+	while (!success);	
+}
+
+
+//*********************************************************************************************************
+// this device function only changes a root if it hasn't been changed before
+
+template <typename root_iterator_type>
+__device__
+void set_new_root_only_if_not_defined_before(root_iterator_type roots_iter, unsigned int entry, unsigned int new_root)
+{
+	using root_value_type = typename root_iterator_type::value_type;
+	
+	root_value_type *ptr = thrust::raw_pointer_cast(& (* (roots_iter + entry)));
+	
+	atomicCAS(ptr, entry, new_root);
+}
+
+//*********************************************************************************************************
+// this function calculates a position in the upper triangle of a matrix ... for later uses
+
+__device__ int int_sqrt(int x)
+{
+	return truncf(__frsqrt_rn(x));
+}
+
+__device__ 
+thrust::pair<int,int> calc_triangle_position(int position)
+{
+	int i = (int_sqrt(8*position) + 1)/2;
+	int j = position - (i*(i-1))/2;
+	return thrust::make_pair(i,j);
+}
+
+
+//*********************************************************************************************************
+// this simple kernel just follows the branches of a tree at a each position to its root and saves this information
+
+
+template <typename root_iterator_type>
+__global__
+void 
+tree_reduction_kernel(root_iterator_type roots_iter, unsigned int n_points)
+{
+	using root_value_type = typename root_iterator_type::value_type;
+	
+	for (root_value_type x = blockIdx.x * blockDim.x + threadIdx.x; x < n_points; x+= blockDim.x*gridDim.x)
+	{
+		root_value_type cur  = x;
+		root_value_type next = *(roots_iter + cur);
+		
+		while (next != cur)
+		{
+			cur = next;
+			next = *(roots_iter + cur);
+		}
+		
+		atomicExch(thrust::raw_pointer_cast(&(*(roots_iter + x))), cur);
+	}
+}
+
+
+//****************************************************************************************** 
+// These functions were prototyped in R and are necessary to calculate positions in
+// the scanning diagonals
+
+
+
+template <typename str_index_iterator_type>
+__device__
+inline void strided_copy_global_to_shared_string(str_index_iterator_type str_index_iterator, char* shared_pointer)
+{
+	unsigned int len = thrust::get<1>(*str_index_iterator);
+	char* raw_string_pointer = thrust::raw_pointer_cast( & (thrust::get<0>(*str_index_iterator) ));
+	
+	for (unsigned int i=threadIdx.x; i < len; i+= blockDim.x)
+	{
+		shared_pointer[i] = raw_string_pointer[i]; 
+	}
+}
+
+
+__device__
+int
+diag_to_i(int D, int index, int width)
+{
+  return index - (width/2) + (D/2);
+}
+
+__device__
+int
+diag_to_j(int D, int index, int width)
+{
+  return ((D+1)/2) - index + (width/2);
+}
+
+__device__
+int
+ij_to_diag(int i, int j)
+{
+  return i+j;
+}
+
+__device__
+int
+ij_to_index(int i, int j, int width)
+{
+  return i - ((i+j)/2) + (width/2);
+}
+
+__device__
+int
+ij_to_address(int i, int j, int width)
+{
+  int dx = ij_to_diag(i,j) % 2;
+  int tx = ij_to_index(i,j, width);
+  return dx*width + tx;
+}
+
+__device__
+int
+diag_to_address(int D, int index, int width)
+{
+  return (D % 2)*width + index;
+}
+
+
+//****************************************************************************************** 
+__device__
+int
+improved_levenshtein_distance(char* subjstring, unsigned int subj_len, char* querystring, unsigned int query_len, int* shared_memory_block)
+{
+	int width = 2 + max(query_len, subj_len);
+	
+	for (int n = threadIdx.x; n < 2*width; n+=blockDim.x) shared_memory_block[n] = 0;
+	
+	for (int dx = 0; dx < query_len + subj_len + 1; ++dx)
+    {
+		int initval = (dx == 0)? 0 : dx;
+        
+	    for (int index = threadIdx.x; index <  width; index += blockDim.x)
+	    {
+			int ix = diag_to_i(dx, index, width);
+			int jx = diag_to_j(dx, index, width);
+            
+			if (ix >= 0 && ix <= subj_len && jx >= 0 && jx <= query_len)
+	        {
+				int ma = diag_to_address(dx, index, width);
+				if (ix == 0 || jx == 0)
+				{
+					shared_memory_block[ma] = initval;
+				} 
+				else 
+				{
+					int ma11 = ij_to_address(ix-1, jx-1, width);
+					int ma01 = ij_to_address(ix, jx-1, width);
+					int ma10 = ij_to_address(ix-1, jx, width);
+          				
+					int val11 = shared_memory_block[ma11];
+					if (subjstring[ix-1] != querystring[jx-1]) val11 += 1;
+          
+					int val01 = shared_memory_block[ma01] + 1;
+					int val10 = shared_memory_block[ma10] + 1;
+          
+					shared_memory_block[ma] = min(min(val11, val01), val10);
+				}
+			}
+		}
+		__syncthreads();
+	}
+  
+	return shared_memory_block[ij_to_address(subj_len, query_len, width)];  
+}
+
+
+ 
+//****************************************************************************************** 
+// this device function expects a 2nd dimension of a block and 
+// uses _syncthreads carefully! ThreadIdx.y contains the index of the string in shared memory
+
+__device__
+int
+improved_2D_levenshtein_distance(char* subjstring, unsigned int subj_len, char* querystring, unsigned int query_len, int* shared_memory_block, unsigned int max_strlen)
+{
+	int width = 2 + max(subj_len, query_len);
+	
+	unsigned int query_str_index = max_strlen * threadIdx.y;
+	unsigned int mem_index = 2*(max_strlen+2) * threadIdx.y;
+	
+	int active_threads = 1;	
+	
+	for (unsigned int n = threadIdx.x; n < 2*width; n+=blockDim.x) shared_memory_block[mem_index + n] = 0;
+	
+	int dx = 0;
+	while (active_threads)
+	{
+		int initval = (dx == 0)? 0 : dx;
+        
+	    for (int index = threadIdx.x; index <  width; index += blockDim.x)
+	    {
+			int ix = diag_to_i(dx, index, width);
+			int jx = diag_to_j(dx, index, width);
+            
+			if (ix >= 0 && ix <= subj_len && jx >= 0 && jx <= query_len)
+	        {
+				int ma = diag_to_address(dx, index, width);
+				if (ix == 0 || jx == 0)
+				{
+					shared_memory_block[mem_index + ma] = initval;
+				} 
+				else 
+				{
+					int ma11 = ij_to_address(ix-1, jx-1, width);
+					int ma01 = ij_to_address(ix, jx-1, width);
+					int ma10 = ij_to_address(ix-1, jx, width);
+          				
+					int val11 = shared_memory_block[mem_index + ma11];
+					if (subjstring[ix-1] != querystring[query_str_index+jx-1]) val11 += 1;
+          
+					int val01 = shared_memory_block[mem_index + ma01] + 1;
+					int val10 = shared_memory_block[mem_index + ma10] + 1;
+          
+					shared_memory_block[mem_index + ma] = min(min(val11, val01), val10);
+				}
+			}
+		}
+		++dx;
+		active_threads = __syncthreads_count(dx < query_len + subj_len + 1) > 0;
+	}
+  
+	return shared_memory_block[mem_index + ij_to_address(subj_len, query_len, width)];  
+}
+
+
+//****************************************************************************************** 
+
+__device__
+int
+improved_hamming_distance(char* subjstring, unsigned int subj_len, char* querystring, unsigned int query_len)
+{
+	int neqsum = 0;
+	int sync_secure = 0;			
+				
+	for (unsigned int tx = threadIdx.x; sync_secure * blockDim.x < query_len; tx += blockDim.x, ++sync_secure)
+	{	
+		int neq;		
+		if (tx < query_len) 
+			neq =  querystring[tx] != subjstring[tx];
+		else
+			neq = 0;
+							
+		neqsum += __syncthreads_count(neq);
+	}
+	return neqsum;
+}
+
+
+//*********************************************************************************************************
+// these kernels do an exact comparison of bitsets
+
+// Version 1
+template <int sN, class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int bitset_values_equal (iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+{
+	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
+	
+	typedef Int2Type<sN - 1> mapType;
+	mapType mapInt;
+	
+	int cmp = 1;
+	int result = compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+	
+	for (int position = threadIdx.x; position < current_width; position += blockDim.x)
+	{
+		cmp = cmp && (pointer1[position] == pointer2[position]);
+	}
+	
+	result = result && (__syncthreads_count(cmp) > 0);
+	
+	return result;
+}	
+	
+// Version 2	
+template <class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+{
+	unsigned int current_width = thrust::get<0>(gene_width_tuple);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+	
+	int cmp = 1;
+	for (int position = threadIdx.x; position < current_width; position += blockDim.x)
+	{
+		cmp = cmp && (pointer1[position] == pointer2[position]);
+	}
+	
+	return (__syncthreads_count(cmp) > 0);
+}	
+
+
+// BaseCaller
+template <class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+{
+	typedef Int2Type<thrust::tuple_size<typename iterator_tuple_type::value_type>::value-1> mapType;
+	mapType map;
+	
+	return bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, map);
+}
+
+//**********************************************************************************************************
+
+
+
+
+
+//*********************************************************************************************************
+// these functions are working within a single thread to allow optimal usage of the GPU
+
+
+
+// Version 1
+template <int sN, class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal (iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+{
+	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
+	
+	typedef Int2Type<sN - 1> mapType;
+	mapType mapInt;
+	
+	
+	bool result = singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+	bool cmp = result;
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+	
+	int position = 0; 
+	while (position < current_width && cmp)
+	{
+		cmp = (pointer1[position] == pointer2[position]);
+		++position;
+	}
+	return cmp;
+}	
+
+	
+// Version 2	
+template <class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+{
+	unsigned int current_width = thrust::get<0>(gene_width_tuple);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+	
+	bool cmp = true;
+	int position = 0; 
+	while (position < current_width && cmp)
+	{
+		cmp = (pointer1[position] == pointer2[position]);
+		++position;
+	}
+	return cmp;
+}	
+
+
+
+// BaseCaller
+template <class iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+{
+	typedef Int2Type<thrust::tuple_size<typename iterator_tuple_type::value_type>::value-1> mapType;
+	mapType map;
+	
+	return singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, map);
+}
+
+
+
+//************************************************************************************************************************
+	// Version 1
+	template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+	__device__ 
+	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+	{
+		unsigned int current_width = thrust::get<sN>(gene_width_tuple);
+		
+		typedef Int2Type<sN - 1> mapType;
+		mapType mapInt;
+		
+		int cmp = 0;
+		int result = compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+		
+		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+		
+		for (int position = 0; position < current_width; ++position)
+		{
+			cmp |= (pointer1[position] & pointer2[position]);
+		}
+		
+		result = result && cmp;
+		
+		return result;
+	}	
+		
+	// Version 2	
+	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+	__device__ 
+	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+	{
+		unsigned int current_width = thrust::get<0>(gene_width_tuple);
+		
+		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+		
+		int cmp = 0;
+		for (int position = 0; position < current_width; ++position)
+		{
+			cmp |= (pointer1[position] & pointer2[position]);
+		}
+		
+		return cmp;
+	}	
+	
+	
+	// BaseCaller
+	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+	__device__ 
+	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+	{
+		static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
+		typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
+		mapType map;
+		
+		return singlet_compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, map);
+	}
+	
+	
+
+
+
+//*********************************************************************************************************
+// this kernel does an exact match comparison
+// it contains a lot of branches, which are actually on block level and not thread level. So this should
+// not reduce performance too much
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type, typename root_iterator_type>
+__global__
+void 
+find_duplicates_kernel(bitset_iterator_type bitset_iterator, 
+					   bitset_properties_type bitset_properties, 
+                       stringset_iterator_type stringset_iterator, 
+                       root_iterator_type roots_iterator, 
+                       unsigned n_points)
+{
+	
+	// first, do the grid stride loop
+	for (unsigned query_index = blockIdx.x; query_index < n_points; query_index += gridDim.x)
+	{
+		for (unsigned subj_index = blockIdx.y; subj_index < n_points; subj_index += gridDim.y)
+		{
+			// now we're in business
+			if (query_index < subj_index)  // avoid duplicate comparisons and comparisons with itself
+			{
+				if (thrust::get<2>(*(stringset_iterator + query_index)) == thrust::get<2>(*(stringset_iterator + subj_index)))  // if string hashes are identical
+				{
+					unsigned int query_len = thrust::get<1>(*(stringset_iterator + query_index));
+					unsigned int subj_len  = thrust::get<1>(*(stringset_iterator + subj_index));
+					if (query_len == subj_len) // and if string lengths are identical
+					{
+						int neqsum = 0;
+						char *query_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + query_index)) );
+						char  *subj_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + subj_index)) );
+						
+						int neq = 0;
+						
+						for (unsigned int tx = threadIdx.x; tx < query_len; tx += blockDim.x)
+						{	
+							if (query_string_ptr[tx] != subj_string_ptr[tx]) ++neq;
+						}
+						
+						neqsum = __syncthreads_count(neq);  // the exact number is not so important ... 
+						
+						if ( neqsum == 0 )   // and if strings are still identical
+						{
+							// now compare the bitsets
+							int still_equal = bitset_values_equal(bitset_iterator + query_index, bitset_iterator + subj_index, bitset_properties);
+							__syncthreads();
+							
+							if (still_equal && threadIdx.x == 0)  // this is just done by the first thread
+							{
+								// search for root of query
+								
+								//unsigned int root_query = find_root(roots_iterator, query_index);
+								//unsigned int q_point = *(roots_iterator+query_index);
+								//printf("The root of %u points to %u with %u as root\n", query_index,q_point, root_query);
+								// printf("Want to connect %u with root %u of %u \n", subj_index, root_query, query_index);
+								
+								// set_new_root(roots_iterator, subj_index, query_index);
+								union_a_and_b(roots_iterator, subj_index, query_index);
+							}
+						}
+					}
+				} // if
+			} // if
+		} // for
+	} // for
+}
+
+
+//**********
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename result_iterator_type>
+__global__
+void
+find_eq_vgenes(bitset_iterator_type bitset_iterator_1, 
+			   bitset_iterator_type bitset_iterator_2, 
+			   bitset_properties_type bitset_properties, 
+			   result_iterator_type result_iter)
+{
+	if (singlet_bitset_values_equal(bitset_iterator_1, bitset_iterator_2 + blockIdx.x, bitset_properties)) 
+	{ 
+		*(result_iter + blockIdx.x) = 1;
+		int ij[4], jj[4];
+		int *pp1 = thrust::raw_pointer_cast(& thrust::get<0>(*bitset_iterator_1));
+		int *pp2 = thrust::raw_pointer_cast(& thrust::get<0>(*(bitset_iterator_2 + blockIdx.x)));
+		for (unsigned int x = 0; x < 4; ++x) { ij[x] = pp2[x]; jj[x] = pp1[x]; }
+		printf("( %d %d %d %d = %d %d %d %d )", jj[0], jj[1], jj[2], jj[3], ij[0], ij[1], ij[2], ij[3]);
+	}
+}
+	
+
+
+//*********************************************************************************************************
+// this kernel does an exact match comparison
+// it contains a lot of branches, which are actually on block level and not thread level. So this should
+// not reduce performance too much
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type, typename root_iterator_type>
+__global__
+void 
+singlet_find_duplicates_kernel(bitset_iterator_type bitset_iterator, 
+					   bitset_properties_type bitset_properties, 
+                       stringset_iterator_type stringset_iterator, 
+                       root_iterator_type roots_iterator, 
+                       unsigned n_points)
+{	
+	// first, do the grid stride loop
+	for (unsigned int x_index = blockIdx.x*blockDim.x + threadIdx.x; x_index < n_points; x_index += blockDim.x * gridDim.x)
+	{
+		for (unsigned int y_index = blockIdx.y*blockDim.y + threadIdx.y; y_index < n_points; y_index += blockDim.y * gridDim.y)
+		{
+			unsigned int query_index = x_index; //  + threadIdx.y * blockDim.x; query_index = query_index % n_points;
+			unsigned int subj_index  = y_index; //  + threadIdx.x * blockDim.y; subj_index  = subj_index  % n_points;
+			// now we're in business
+			if (query_index < subj_index)  // avoid duplicate comparisons and comparisons with itself
+			{
+				if (thrust::get<2>(*(stringset_iterator + query_index)) == thrust::get<2>(*(stringset_iterator + subj_index)))  // if string hashes are identical
+				{
+					unsigned int query_len = thrust::get<1>(*(stringset_iterator + query_index));
+					unsigned int subj_len  = thrust::get<1>(*(stringset_iterator + subj_index));
+					if (query_len == subj_len) // and if string lengths are identical
+					{
+						
+						if (singlet_bitset_values_equal(bitset_iterator + query_index, bitset_iterator + subj_index, bitset_properties))
+						{
+							char *query_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + query_index)) );
+							char  *subj_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + subj_index)) );
+							unsigned int position = 0;
+							bool eq = true;
+							while (position < query_len && eq)
+							{
+								eq = query_string_ptr[position] == subj_string_ptr[position];
+								++position;
+							}
+							if (eq)
+							{
+								// set_new_root(roots_iterator, subj_index, query_index);
+								union_a_and_b(roots_iterator, subj_index, query_index);
+							}		
+						}						
+					}
+				} 
+			} 
+		} 
+	}
+}
+
+
+//*********************************************************************************************************
+//*********************************************************************************************************
+//*********************************************************************************************************
+// This kernel is an alternate version to identify core points
+
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type,
+		  typename unique_indices_iterator_type, typename copies_iterator_type,
+		  typename core_point_iterator_type, typename distance_functor_type>
+__global__
+void 
+half_core_points( bitset_iterator_type bitset_iterator, 
+				  bitset_properties_type bitset_properties, 
+				  stringset_iterator_type stringset_iterator,
+				  unique_indices_iterator_type unique_indices_iterator,
+				  copies_iterator_type copies_iterator,
+				  core_point_iterator_type core_point_iterator,			      
+				  unsigned int n_points,
+				  unsigned int max_strlen,
+				  distance_functor_type distance_functor,
+				  unsigned int minPts)
+{
+	extern __shared__ int cs[];
+	// first, do the grid stride loop
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	{
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		{
+			unsigned int x_index = *(unique_indices_iterator + x_preindex);
+			unsigned int y_index = *(unique_indices_iterator + y_preindex);
+			
+			if (x_index < y_index && ( *(core_point_iterator + x_index) < minPts  || *(core_point_iterator + y_index) < minPts ))
+			{
+				int result = 1;
+		
+				int x_len = thrust::get<1>(*(stringset_iterator + x_index)),
+					y_len = thrust::get<1>(*(stringset_iterator + y_index));
+						 
+				int schwelle = distance_functor(x_len, y_len);
+				
+				int distance = (x_len > y_len)? (x_len - y_len) : (y_len - x_len);		
+				int hamming_active = 0;
+						
+				result = compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties) && distance <= schwelle;
+				
+				if (result)
+				{		
+					// distribute shared memory
+					char* x_string  = (char*)cs;
+					char* y_string = &x_string[max_strlen];
+					int* residual_shared_memory = (int*)&y_string[max_strlen];
+					
+					strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
+					strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
+								
+					// then calculate Hamming distance
+					if (x_len == y_len)
+					{
+						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
+						hamming_active = 1;
+					}
+											
+					if (!(hamming_active && result))
+					{
+						distance = improved_levenshtein_distance(x_string, x_len, y_string, y_len, residual_shared_memory);
+						result   = distance <= schwelle;
+					}
+				} 
+				
+				if (threadIdx.x == 0 && result) 
+				{
+					static_assert(std::is_same<typename core_point_iterator_type::value_type, typename copies_iterator_type::value_type>::value, "Core and copies iterator value types are not identical!");
+					
+					typename core_point_iterator_type::value_type *core_at_x = thrust::raw_pointer_cast(&  (*(core_point_iterator + x_index)));
+					typename core_point_iterator_type::value_type *core_at_y = thrust::raw_pointer_cast(&  (*(core_point_iterator + y_index)));
+					
+					typename copies_iterator_type::value_type x_copies = *(copies_iterator + x_index);
+					typename copies_iterator_type::value_type y_copies = *(copies_iterator + y_index);
+					
+					atomicAdd(core_at_x, y_copies);
+					
+					atomicAdd(core_at_y, x_copies);						
+					
+				} // if (threadIdx.x == 0 && result) 			
+			}
+			
+		} // for 
+	} // for	
+}
+
+
+//*********************************************************************************************************
+// this kernel is fuses the data
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type, typename roots_iterator_type, 
+		  typename core_point_indices_iterator_type,
+          typename unique_indices_iterator_type, typename core_point_iterator_type, typename distance_functor_type>
+__global__
+void 
+fuse_clusters( bitset_iterator_type bitset_iterator, 
+						bitset_properties_type bitset_properties, 
+					    stringset_iterator_type stringset_iterator,
+					    roots_iterator_type roots_iterator,
+					    core_point_iterator_type core_point_iterator,
+					    core_point_indices_iterator_type core_point_indices_iterator,
+					    unique_indices_iterator_type unique_indices_iterator,
+					    unsigned int n_points,
+					    unsigned int max_strlen,
+					    distance_functor_type distance_functor)
+{
+	extern __shared__ int cs[];
+	// first, do the grid stride loop
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	{
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		{
+			unsigned int x_index = *(core_point_indices_iterator + x_preindex);
+			unsigned int y_index = *(unique_indices_iterator + y_preindex);
+			
+			if (x_index < y_index)
+			{
+								
+				// will proceed only, when x is a core point! 
+					
+				// now we're in business
+				
+				int x_len = thrust::get<1>(*(stringset_iterator + x_index)),
+					y_len = thrust::get<1>(*(stringset_iterator + y_index));
+						 
+				int schwelle = distance_functor(x_len, y_len);
+				
+				int distance = (x_len > y_len)? (x_len - y_len) : (y_len - x_len);		
+				int result = 1;
+				int hamming_active = 0;
+						
+				result = compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties) && distance <= schwelle;
+				
+				if (result)
+				{		
+					// distribute shared memory
+					char* x_string  = (char*)cs;
+					char* y_string = &x_string[max_strlen];
+					int* residual_shared_memory = (int*)&y_string[max_strlen];
+					
+					strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
+					strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
+								
+					// then calculate Hamming distance
+					if (x_len == y_len)
+					{
+						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
+						hamming_active = 1;
+					}
+											
+					if (!(hamming_active && result))
+					{
+						distance = improved_levenshtein_distance(x_string, x_len, y_string, y_len, residual_shared_memory);
+						result   = distance <= schwelle;
+					}
+				} 
+				
+				if (threadIdx.x == 0 && result) {
+					// x will be the master
+					unsigned int x_root = x_index; // find_root(roots_iterator, x_index);
+					
+					// y will be the slave
+					int is_y_core = *(core_point_iterator + y_index);
+					
+					if (is_y_core)
+					{
+						// find root of y and attach it to x_root
+						// set_new_root(roots_iterator, y_index, x_root);
+						union_a_and_b(roots_iterator, y_index, x_root);
+					}
+					else // y is not a core point and will be bound only once!
+					{
+						set_new_root_only_if_not_defined_before(roots_iterator, y_index, x_root);
+					}
+					
+				} // if (threadIdx.x == 0 && result) 
+			
+			} // if (x_index < y_index)
+		} // for 
+	} // for	
+}
+
+
+//*********************************************************************************************************
+ 
+ 
+template <class DataManagementClass>
+class DBSCAN
+{
+	
+	DataManagementClass& DataManager;
+	
+	thrust::device_vector<unsigned int> roots;
+	thrust::device_vector<int> is_core_point_vector;
+	thrust::device_vector<unsigned int> uniques, cluster_ids;
+	thrust::device_vector<int> copies;
+	
+	unsigned int max_blocks[3];
+	unsigned int max_threads;
+	unsigned int max_threads_dim[3];
+	unsigned int max_shared_memory_per_block;
+	unsigned int max_threads_by_multiprocessor;
+	
+	unsigned int minPts;
+	float threshold;
+	unsigned int n_unique;
+		
+	public:
+
+	DBSCAN(DataManagementClass& _DataManager, float _threshold, unsigned int _minPts) : 
+		DataManager(_DataManager),
+		roots(_DataManager.get_n_entries()),
+		uniques(_DataManager.get_n_entries()),
+		copies(_DataManager.get_n_entries(),1),
+		cluster_ids(_DataManager.get_n_entries(),1),
+		is_core_point_vector(_DataManager.get_n_entries())		
+	{
+		threshold = _threshold;
+		minPts = _minPts;
+		
+		// get some device properties
+		cudaDeviceProp devProp;
+        cudaGetDeviceProperties(&devProp, 0);
+        max_shared_memory_per_block = devProp.sharedMemPerBlock;
+		max_threads = devProp.maxThreadsPerBlock;
+		max_threads_by_multiprocessor = devProp.maxThreadsPerMultiProcessor;
+		for (unsigned int i=0; i < 3; ++i) {
+			max_blocks[i]      = devProp.maxGridSize[i];
+			max_threads_dim[i] = devProp.maxThreadsDim[i];
+		}
+		
+		BenchmarkSingleton::Instance().Message("DBSCAN settings: epsilon = " + std::to_string(threshold));
+		BenchmarkSingleton::Instance().Message("DBSCAN settings: minPts = " + std::to_string(minPts));
+		
+		
+	}
+		
+	//************************************************************************************************************************
+	
+	void reduce_trees_to_roots()
+	{
+		// this calls a kernel function which makes the root vector point at the final roots
+		unsigned int n_points = DataManager.get_n_entries();
+		
+		unsigned int blocks = (n_points < max_blocks[0])? n_points : (max_blocks[0]);
+		blocks = ((blocks + max_threads - 1)/max_threads) * max_threads;
+				
+		tree_reduction_kernel<<<blocks, max_threads>>>(roots.begin(), n_points);
+		
+		
+	}
+	
+
+	
+	//************************************************************************************************************************
+	// I found that searching the data for duplicates on the host is quite tedious and can be done in parallel the
+	// same way as clustering occurs. This is actually a clustering, but only on exact duplicates. The advantage here is
+	// that we can use a more efficient kernel. 
+	// In the second clustering step, duplicates are inactivated
+	
+	void identify_duplicates()
+	{
+		// alternate version
+	    unsigned int n_points = DataManager.get_n_entries();
+	    
+	    unsigned int ythreads = max_threads / 32;
+	    ythreads = (ythreads > max_threads_dim[1])? max_threads_dim[1] : ythreads;
+	    unsigned int xthreads = max_threads / ythreads;
+	    ythreads = (xthreads > max_threads_dim[0])? max_threads_dim[0] : xthreads;
+	    
+		unsigned int xblocks = (n_points + xthreads - 1)/xthreads;
+		xblocks = (xblocks < max_blocks[0])? xblocks : (max_blocks[0]);
+				
+		unsigned int yblocks = (n_points + ythreads - 1)/ythreads;
+		yblocks = (yblocks < max_blocks[1])? yblocks : (max_blocks[1]);
+		
+		dim3 block_layout(xthreads, ythreads, 1);
+		dim3 grid_layout(xblocks, yblocks, 1);
+	
+		singlet_find_duplicates_kernel<<<grid_layout, block_layout>>>(DataManager.get_bitset_begin(), DataManager.get_bitset_properties(), DataManager.get_StringDataIterator(), roots.begin(), n_points);
+	}
+	
+	void prepare_copies_vector()
+	{
+		// now, prepare the copies_counter
+		thrust::device_vector<unsigned int> sorted_vals(roots.begin(), roots.end());
+		thrust::device_vector<unsigned int> sum_vector(DataManager.get_n_entries());
+		thrust::device_vector<unsigned int> keys_vector(DataManager.get_n_entries());
+		
+		thrust::sort(thrust::device, sorted_vals.begin(), sorted_vals.end(), thrust::greater<unsigned int>());
+		auto end_iter = thrust::reduce_by_key(thrust::device, sorted_vals.begin(), sorted_vals.end(), thrust::make_constant_iterator(1u), keys_vector.begin(), sum_vector.begin());
+		thrust::fill(thrust::device, copies.begin(), copies.end(), 0);  
+		thrust::scatter(thrust::device, sum_vector.begin(), end_iter.second, keys_vector.begin(), copies.begin());
+	}
+	
+	
+	//************************************************************************************************************************
+	
+	//************************************************************************************************************************
+	// This function identifies core points and non-core points. To reduce workload and expose as much parallelism as
+	// possible, it somehow uses Pareto's law ... 80% of work can be done with 20% of effort.
+		
+	void identify_core_points()
+	{
+		thrust::copy(thrust::device,  copies.begin(), copies.end(), is_core_point_vector.begin());
+		
+		// and fill it with indices in increasing order
+		thrust::sequence(thrust::device, uniques.begin(), uniques.end());
+		
+		// define an iterator that provides information whether an index points to itself in roots
+		auto is_duplicate_iterator = thrust::make_transform_iterator(copies.begin(), equal_to_value_op<unsigned int, bool>(0u));
+		
+		// now, remove the duplicates
+		auto end_indices_iterator = thrust::remove_if(thrust::device, uniques.begin(), uniques.end(), is_duplicate_iterator, thrust::identity<bool>());
+		
+		// transfer to a vector of this class
+		n_unique = end_indices_iterator - uniques.begin();
+		
+		BenchmarkSingleton::Instance().Message("Number of uniques = " + std::to_string(n_unique));
+		
+		unsigned int xblocks = (n_unique < max_blocks[0])? n_unique : (max_blocks[0]);
+		unsigned int yblocks = (n_unique < max_blocks[1])? n_unique : (max_blocks[1]);
+		dim3 grid_layout(xblocks, yblocks, 1);
+				
+		epsilonOneFunctorClass<false> distanceFunctor(threshold);
+		unsigned int stringlength = 1 + (1 + DataManager.get_max_strlen()) / 32;
+		stringlength *= 32;
+
+	    unsigned int nthreads = ((max_threads_by_multiprocessor / max_threads) > max_threads)? (max_threads_by_multiprocessor / max_threads) : max_threads;
+		nthreads = (nthreads > max_threads)? max_threads : nthreads;
+		nthreads = (nthreads > stringlength)? stringlength : nthreads;
+		
+		std::size_t shared_memory_usage = 2*sizeof(char)*stringlength + 2*sizeof(int) * ( 2 + stringlength);
+			
+			
+		half_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
+				  DataManager.get_bitset_begin(), 
+				  DataManager.get_bitset_properties(), 
+				  DataManager.get_StringDataIterator(),
+				  uniques.begin(),
+				  copies.begin(),
+				  is_core_point_vector.begin(),
+				  n_unique,
+				  stringlength,
+				  distanceFunctor,
+				  minPts);
+	
+		thrust::transform(thrust::device, is_core_point_vector.begin(), is_core_point_vector.end(), is_core_point_vector.begin(), larger_or_equal_to_value_op<int,int>(minPts));
+		
+		int ncores = thrust::reduce(thrust::device, is_core_point_vector.begin(), is_core_point_vector.end());	
+				  
+	}
+		
+		
+	//************************************************************************************************************************
+		
+	void grow_clusters()
+	{
+		thrust::device_vector<unsigned int> core_point_indices(n_unique);
+		auto index_iter = thrust::make_counting_iterator(0u);
+		auto ende_core_point_indices_iter = 
+			thrust::copy_if(thrust::device, index_iter, index_iter + DataManager.get_n_entries(), is_core_point_vector.begin(), core_point_indices.begin(), thrust::identity<int>());
+		core_point_indices.erase(ende_core_point_indices_iter, core_point_indices.end());	
+		
+		unsigned n_core_points = core_point_indices.size();
+		BenchmarkSingleton::Instance().Message("Number of core points = " + std::to_string(n_core_points));
+						
+		unsigned int xblocks = (n_core_points < max_blocks[0])? n_core_points : (max_blocks[0]);
+		unsigned int yblocks = (n_unique < max_blocks[1])? n_unique : (max_blocks[1]);
+		dim3 grid_layout(xblocks, yblocks, 1);
+				
+		epsilonOneFunctorClass<false> distanceFunctor(threshold);
+		unsigned int stringlength = 1 + (1 + DataManager.get_max_strlen()) / 32;
+		stringlength *= 32;
+
+	    unsigned int nthreads = ((max_threads_by_multiprocessor / max_threads) > max_threads)? (max_threads_by_multiprocessor / max_threads) : max_threads;
+		nthreads = (nthreads > max_threads)? max_threads : nthreads;
+		nthreads = (nthreads > stringlength)? stringlength : nthreads;
+
+		std::size_t shared_memory_usage = 2*sizeof(char)*stringlength + 2*sizeof(int) * ( 2 + stringlength);
+		
+		
+		fuse_clusters<<<grid_layout, nthreads, shared_memory_usage>>>( 
+						DataManager.get_bitset_begin(), 
+						DataManager.get_bitset_properties(), 
+					    DataManager.get_StringDataIterator(),
+					    roots.begin(),
+					    is_core_point_vector.begin(),
+					    core_point_indices.begin(),
+					    uniques.begin(),
+					    n_unique,
+					    stringlength,
+					    distanceFunctor);
+	
+	}	
+	
+	
+	void re_number_clusters()
+	{
+		thrust::device_vector<unsigned int> intermediate(roots.begin(), roots.end());
+		
+				
+		intermediate.erase(thrust::remove_if(thrust::device, intermediate.begin(), intermediate.end(), is_core_point_vector.begin(), thrust::logical_not<int>()), intermediate.end());
+		
+		
+		thrust::fill(thrust::device, cluster_ids.begin(), cluster_ids.end(), 0);
+		
+		
+		thrust::sort(thrust::device, intermediate.begin(), intermediate.end(), thrust::less<unsigned int>());
+		
+		
+		intermediate.erase(thrust::unique(thrust::device, intermediate.begin(), intermediate.end()), intermediate.end());
+			
+		BenchmarkSingleton::Instance().Message("Total number of clusters = " + std::to_string(intermediate.size()));
+		
+		thrust::device_vector<unsigned int> intermediate3(roots.size(), 0);
+		auto counter_iter = thrust::make_counting_iterator(1u);
+		
+		thrust::scatter(thrust::device, counter_iter, counter_iter + intermediate.size(), intermediate.begin(), intermediate3.begin());
+		
+		thrust::gather(thrust::device, roots.begin(), roots.end(), intermediate3.begin(), cluster_ids.begin());
+	}
+	
+	
+	//************************************************************************************************************************
+	
+	
+	void doScan() {
+		BenchmarkSingleton::Instance().StartTimer("Clustering core process");
+		
+		// prepare roots
+		thrust::sequence(thrust::device, roots.begin(), roots.end());   // every entry directs to itself
+		BenchmarkSingleton::Instance().Message("Total number of sequences = " + std::to_string(DataManager.get_n_entries()));
+				
+		// inactivate duplicates in a first step
+		BenchmarkSingleton::Instance().StartTimer("Identify Duplicates");
+		identify_duplicates();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Identify Duplicates");
+		
+		BenchmarkSingleton::Instance().StartTimer("Reduction of duplicate information tree structure");
+		reduce_trees_to_roots();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Reduction of duplicate information tree structure");
+		
+		BenchmarkSingleton::Instance().StartTimer("Determine copies");
+		prepare_copies_vector();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Determine copies");
+		
+				
+		// prepare core point indicator vector
+		BenchmarkSingleton::Instance().StartTimer("Identify core points");
+		thrust::fill(thrust::device, is_core_point_vector.begin(), is_core_point_vector.end(), 0);
+		identify_core_points();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Identify core points");
+		
+		
+		// grow clusters
+		BenchmarkSingleton::Instance().StartTimer("Grow clusters");
+		grow_clusters();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Grow clusters");
+				
+		BenchmarkSingleton::Instance().StartTimer("Reduction of cluster information tree structure");
+		reduce_trees_to_roots();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Reduction of cluster information tree structure");
+		
+		BenchmarkSingleton::Instance().StartTimer("Re-number clusters and identify noise");
+		re_number_clusters();
+		cudaDeviceSynchronize();
+		BenchmarkSingleton::Instance().StopTimer("Re-number clusters and identify noise");
+		
+		BenchmarkSingleton::Instance().StopTimer("Clustering core process");
+		
+	}
+		
+	thrust::device_vector<unsigned int>::iterator get_cluster_ids()
+	{
+		copy(thrust::device, roots.begin(), roots.end(), cluster_ids.begin());   // delete later
+		return cluster_ids.begin();
+	}
+	
+	thrust::device_vector<int>::iterator get_cores()
+	{
+		return is_core_point_vector.begin();
+	}
+	
+	thrust::device_vector<int>::iterator get_copies_iterator()
+	{
+		return copies.begin();
+	}
+	
+	thrust::device_vector<unsigned int>::iterator get_uniques_iterator()
+	{
+		return uniques.begin();
+	}
+	
+	unsigned int get_n_uniques()
+	{
+		return n_unique;
+	}
+};
