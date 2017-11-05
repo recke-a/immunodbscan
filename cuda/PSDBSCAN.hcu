@@ -163,6 +163,34 @@ tree_reduction_kernel(root_iterator_type roots_iter, unsigned int n_points)
 	}
 }
 
+//*********************************************************************************************************
+// this kernel is for evaluation of this algorithm only.
+
+template <typename root_iterator_type, typename depth_iterator_type>
+__global__
+void 
+tree_depth_evaluation_kernel(root_iterator_type roots_iter, depth_iterator_type depth_iterator, unsigned int n_points, unsigned int max_depth)
+{
+	using root_value_type = typename root_iterator_type::value_type;
+	using depth_value_type = typename depth_iterator_type::value_type;
+	
+	for (root_value_type x = blockIdx.x * blockDim.x + threadIdx.x; x < n_points; x+= blockDim.x*gridDim.x)
+	{
+		depth_value_type depth = 0;
+		root_value_type cur  = x;
+		root_value_type next = *(roots_iter + cur);
+		
+		while (next != cur && depth < max_depth)
+		{
+			++depth;
+			cur = next;
+			next = *(roots_iter + cur);
+		}
+		
+		atomicAdd(thrust::raw_pointer_cast(&(*(depth_iterator + depth))), 1);
+	}
+}
+
 
 //****************************************************************************************** 
 // These functions were prototyped in R and are necessary to calculate positions in
@@ -703,7 +731,167 @@ singlet_find_duplicates_kernel(bitset_iterator_type bitset_iterator,
 }
 
 
+
+
+
 //*********************************************************************************************************
+//*********************************************************************************************************
+
+// these two kernels are for a pure Hamming distance approach
+
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type,
+		  typename unique_indices_iterator_type, typename copies_iterator_type,
+		  typename core_point_iterator_type, typename distance_functor_type>
+__global__
+void 
+half_hamming_core_points( bitset_iterator_type bitset_iterator, 
+				  bitset_properties_type bitset_properties, 
+				  stringset_iterator_type stringset_iterator,
+				  unique_indices_iterator_type unique_indices_iterator,
+				  copies_iterator_type copies_iterator,
+				  core_point_iterator_type core_point_iterator,			      
+				  unsigned int n_points,
+				  unsigned int max_strlen,
+				  distance_functor_type distance_functor,
+				  unsigned int minPts)
+{
+	extern __shared__ int cs[];
+	// first, do the grid stride loop
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	{
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		{
+			unsigned int x_index = *(unique_indices_iterator + x_preindex);
+			unsigned int y_index = *(unique_indices_iterator + y_preindex);
+			
+			if (x_index < y_index && ( *(core_point_iterator + x_index) < minPts  || *(core_point_iterator + y_index) < minPts ))
+			{				
+				int x_len = thrust::get<1>(*(stringset_iterator + x_index)),
+					y_len = thrust::get<1>(*(stringset_iterator + y_index));
+						 
+				int schwelle = distance_functor(x_len, y_len);
+												
+				int result = 0;
+			
+				if (x_len == y_len)
+				{
+					if (compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
+					{
+						char* x_string  = (char*)cs;
+						char* y_string = &x_string[max_strlen];
+						
+						strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
+						strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
+					
+						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
+						
+						// the sync_threads part is not critical here, because everything is happening within a block
+					}					
+				}
+								
+				if (threadIdx.x == 0 && result) 
+				{
+					static_assert(std::is_same<typename core_point_iterator_type::value_type, typename copies_iterator_type::value_type>::value, "Core and copies iterator value types are not identical!");
+					
+					typename core_point_iterator_type::value_type *core_at_x = thrust::raw_pointer_cast(&  (*(core_point_iterator + x_index)));
+					typename core_point_iterator_type::value_type *core_at_y = thrust::raw_pointer_cast(&  (*(core_point_iterator + y_index)));
+					
+					typename copies_iterator_type::value_type x_copies = *(copies_iterator + x_index);
+					typename copies_iterator_type::value_type y_copies = *(copies_iterator + y_index);
+					
+					atomicAdd(core_at_x, y_copies);
+					
+					atomicAdd(core_at_y, x_copies);						
+					
+				} // if (threadIdx.x == 0 && result) 			
+			}
+			
+		} // for 
+	} // for	
+}
+
+
+//*********************************************************************************************************
+//*********************************************************************************************************
+// this kernel is fuses the data in a purely hamming distance approach
+
+template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type, typename roots_iterator_type, 
+		  typename core_point_indices_iterator_type,
+          typename unique_indices_iterator_type, typename core_point_iterator_type, typename distance_functor_type>
+__global__
+void 
+fuse_hamming_clusters( bitset_iterator_type bitset_iterator, 
+						bitset_properties_type bitset_properties, 
+					    stringset_iterator_type stringset_iterator,
+					    roots_iterator_type roots_iterator,
+					    core_point_iterator_type core_point_iterator,
+					    core_point_indices_iterator_type core_point_indices_iterator,
+					    unique_indices_iterator_type unique_indices_iterator,
+					    unsigned int n_points,
+					    unsigned int max_strlen,
+					    distance_functor_type distance_functor)
+{
+	extern __shared__ int cs[];
+	// first, do the grid stride loop
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	{
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		{
+			unsigned int x_index = *(core_point_indices_iterator + x_preindex);
+			unsigned int y_index = *(unique_indices_iterator + y_preindex);
+			
+			if (x_index < y_index)
+			{
+				int x_len = thrust::get<1>(*(stringset_iterator + x_index)),
+					y_len = thrust::get<1>(*(stringset_iterator + y_index));
+						 
+				int schwelle = distance_functor(x_len, y_len);
+												
+				int result = 0;
+			
+				if (x_len == y_len)
+				{
+					if (compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
+					{
+						char* x_string  = (char*)cs;
+						char* y_string = &x_string[max_strlen];
+						
+						strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
+						strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
+					
+						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
+						
+						// the sync_threads part is not critical here, because everything is happening within a block
+					}					
+				}
+				
+				if (threadIdx.x == 0 && result) {
+					// x will be the master
+					unsigned int x_root = x_index; // find_root(roots_iterator, x_index);
+					
+					// y will be the slave
+					int is_y_core = *(core_point_iterator + y_index);
+					
+					if (is_y_core)
+					{
+						// find root of y and attach it to x_root
+						// set_new_root(roots_iterator, y_index, x_root);
+						union_a_and_b(roots_iterator, y_index, x_root);
+					}
+					else // y is not a core point and will be bound only once!
+					{
+						set_new_root_only_if_not_defined_before(roots_iterator, y_index, x_root);
+					}
+					
+				} // if (threadIdx.x == 0 && result) 
+			
+			} // if (x_index < y_index)
+		} // for 
+	} // for	
+}
+
+
 //*********************************************************************************************************
 //*********************************************************************************************************
 // This kernel is an alternate version to identify core points
@@ -913,6 +1101,8 @@ class DBSCAN
 	unsigned int minPts;
 	float threshold;
 	unsigned int n_unique;
+	bool pure_hamming_approach;
+	bool evaluate_trees_wished;
 		
 	public:
 
@@ -922,7 +1112,9 @@ class DBSCAN
 		uniques(_DataManager.get_n_entries()),
 		copies(_DataManager.get_n_entries(),1),
 		cluster_ids(_DataManager.get_n_entries(),1),
-		is_core_point_vector(_DataManager.get_n_entries())		
+		is_core_point_vector(_DataManager.get_n_entries()),
+		pure_hamming_approach(false),
+		evaluate_trees_wished(false)
 	{
 		threshold = _threshold;
 		minPts = _minPts;
@@ -943,6 +1135,19 @@ class DBSCAN
 		
 		
 	}
+	
+	//************************************************************************************************************************
+	
+	void use_only_hamming()
+	{
+		pure_hamming_approach = true;
+		BenchmarkSingleton::Instance().Message("DBSCAN settings: using Hamming distance measure instead of Levenshtein distance");
+	}
+		
+	void set_wish_for_tree_evaluation()
+	{
+		evaluate_trees_wished = true;		
+	}	
 		
 	//************************************************************************************************************************
 	
@@ -956,10 +1161,30 @@ class DBSCAN
 				
 		tree_reduction_kernel<<<blocks, max_threads>>>(roots.begin(), n_points);
 		
-		
 	}
 	
-
+	
+	void evaluate_trees()
+	{
+		// this calls a kernel function which makes the root vector point at the final roots
+		unsigned int n_points = DataManager.get_n_entries();
+		
+		unsigned int blocks = (n_points < max_blocks[0])? n_points : (max_blocks[0]);
+		blocks = ((blocks + max_threads - 1)/max_threads) * max_threads;
+		
+		// 
+		thrust::device_vector<unsigned int> depth_vector(21,0);
+		unsigned int maxdepth = 20;
+				
+		tree_depth_evaluation_kernel<<<blocks, max_threads>>>(roots.begin(), depth_vector.begin(), n_points, maxdepth);
+		
+		BenchmarkSingleton::Instance().Message("Union find tree depth structure");
+		for (unsigned int i = 0; i <= maxdepth; ++i)
+		{	
+			BenchmarkSingleton::Instance().Message("Number of trees with depth " + std::to_string(i) + ": " + std::to_string(depth_vector[i]));
+		}
+	}
+	
 	
 	//************************************************************************************************************************
 	// I found that searching the data for duplicates on the host is quite tedious and can be done in parallel the
@@ -1005,6 +1230,9 @@ class DBSCAN
 	
 	//************************************************************************************************************************
 	
+	
+	
+	
 	//************************************************************************************************************************
 	// This function identifies core points and non-core points. To reduce workload and expose as much parallelism as
 	// possible, it somehow uses Pareto's law ... 80% of work can be done with 20% of effort.
@@ -1042,7 +1270,9 @@ class DBSCAN
 		std::size_t shared_memory_usage = 2*sizeof(char)*stringlength + 2*sizeof(int) * ( 2 + stringlength);
 			
 			
-		half_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
+		if (pure_hamming_approach)
+		{
+			half_hamming_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
 				  DataManager.get_bitset_begin(), 
 				  DataManager.get_bitset_properties(), 
 				  DataManager.get_StringDataIterator(),
@@ -1053,7 +1283,21 @@ class DBSCAN
 				  stringlength,
 				  distanceFunctor,
 				  minPts);
-	
+		} else 
+		{
+			half_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
+					  DataManager.get_bitset_begin(), 
+					  DataManager.get_bitset_properties(), 
+					  DataManager.get_StringDataIterator(),
+					  uniques.begin(),
+					  copies.begin(),
+					  is_core_point_vector.begin(),
+					  n_unique,
+					  stringlength,
+					  distanceFunctor,
+					  minPts);
+		}
+		
 		thrust::transform(thrust::device, is_core_point_vector.begin(), is_core_point_vector.end(), is_core_point_vector.begin(), larger_or_equal_to_value_op<int,int>(minPts));
 		
 		int ncores = thrust::reduce(thrust::device, is_core_point_vector.begin(), is_core_point_vector.end());	
@@ -1088,8 +1332,9 @@ class DBSCAN
 
 		std::size_t shared_memory_usage = 2*sizeof(char)*stringlength + 2*sizeof(int) * ( 2 + stringlength);
 		
-		
-		fuse_clusters<<<grid_layout, nthreads, shared_memory_usage>>>( 
+		if (pure_hamming_approach)
+		{
+			fuse_hamming_clusters<<<grid_layout, nthreads, shared_memory_usage>>>( 
 						DataManager.get_bitset_begin(), 
 						DataManager.get_bitset_properties(), 
 					    DataManager.get_StringDataIterator(),
@@ -1100,7 +1345,22 @@ class DBSCAN
 					    n_unique,
 					    stringlength,
 					    distanceFunctor);
-	
+		} else
+		{
+			fuse_clusters<<<grid_layout, nthreads, shared_memory_usage>>>( 
+							DataManager.get_bitset_begin(), 
+							DataManager.get_bitset_properties(), 
+						    DataManager.get_StringDataIterator(),
+						    roots.begin(),
+						    is_core_point_vector.begin(),
+						    core_point_indices.begin(),
+						    uniques.begin(),
+						    n_unique,
+						    stringlength,
+						    distanceFunctor);
+		}
+		
+		
 	}	
 	
 	
@@ -1171,6 +1431,12 @@ class DBSCAN
 		grow_clusters();
 		cudaDeviceSynchronize();
 		BenchmarkSingleton::Instance().StopTimer("Grow clusters");
+		
+		if (evaluate_trees_wished) {
+			
+			evaluate_trees();	
+		}
+		
 				
 		BenchmarkSingleton::Instance().StartTimer("Reduction of cluster information tree structure");
 		reduce_trees_to_roots();
@@ -1188,7 +1454,7 @@ class DBSCAN
 		
 	thrust::device_vector<unsigned int>::iterator get_cluster_ids()
 	{
-		copy(thrust::device, roots.begin(), roots.end(), cluster_ids.begin());   // delete later
+		// copy(thrust::device, roots.begin(), roots.end(), cluster_ids.begin());   // delete later
 		return cluster_ids.begin();
 	}
 	

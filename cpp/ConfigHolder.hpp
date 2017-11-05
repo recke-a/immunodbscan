@@ -187,6 +187,23 @@ class ConfigHolderClass
 		return tree.get<unsigned int>("minimum_number_of_neighbors");
 	}
 
+	bool is_set_only_hamming()
+	{
+		return tree.get("use_hamming", false);
+	}
+
+	bool get_tree_depth_statistics()
+	{
+		return tree.get("get_tree_depth_statistics",false);
+	}
+
+	//*************************************************************************************************	
+	
+	bool remove_noise_from_output()
+	{
+		return tree.get<bool>("remove_noise_from_output");
+	}
+
 	//*************************************************************************************************	
 	
 	std::string get_DBSCAN_column_name(DBSCANColumnSelectionType what)

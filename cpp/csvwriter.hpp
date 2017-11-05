@@ -59,7 +59,11 @@
 			auto it = table_input_begin; 
 			while (it != table_input_end)
 			{
-				out << _quotation << (*it).at(row) << _quotation;
+				if (_quotation != '\0')
+					out << _quotation << (*it).at(row) << _quotation;
+				else
+					out << (*it).at(row);
+					
 				++it;
 				if (it != table_input_end) out << _separator;
 			}

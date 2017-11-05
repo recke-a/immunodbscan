@@ -34,7 +34,7 @@
 InterlinkClass::InterlinkClass(NormalStringVectorZipIteratorType InputStrings, unsigned int _n_entries, 
   NormalStringVectorIteratorType V_genes_reference, unsigned int V_gene_variant_count,
   NormalStringVectorIteratorType J_genes_reference, unsigned int J_gene_variant_count,
-  float _threshold, unsigned int _minPts) 
+  float _threshold, unsigned int _minPts, bool use_only_hamming, bool eval_trees) 
   :
   clusters(_n_entries, 0),
   uniques(_n_entries, 0), 
@@ -73,6 +73,8 @@ InterlinkClass::InterlinkClass(NormalStringVectorZipIteratorType InputStrings, u
 	using dbscan_container_type = decltype(my_container);	
 
 	DBSCAN<dbscan_container_type> runner(my_container, _threshold, _minPts);
+	if  (use_only_hamming) runner.use_only_hamming();
+	if (eval_trees) runner.set_wish_for_tree_evaluation();
 	runner.doScan();
 	
 	 

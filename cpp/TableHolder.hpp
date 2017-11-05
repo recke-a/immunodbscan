@@ -142,6 +142,33 @@ class TableHolderClass
 	}
 	
 	//*************************************************************************************	
+	
+	template <typename label_iterator_type>
+	void delete_rows_by_label(label_iterator_type begin_label, label_iterator_type end_label)
+	{
+		unsigned int n_deleted = std::accumulate(begin_label, end_label, 0);
+		unsigned int new_total_rows = get_total_rows_count() - n_deleted;
+		
+		BenchmarkSingleton::Instance().Message("Deleting " + std::to_string(n_deleted) + " rows");
+			
+		std::for_each(StringTableContainer.begin(), StringTableContainer.end(), [&](std::vector<std::string>& stvec)
+			{
+				auto it = begin_label;
+				auto sit = stvec.begin();
+				auto tit = stvec.begin();
+				
+				for (; it != end_label; ++it, ++sit)
+				{
+					*tit = *sit;
+					if (! (*it)) ++tit;
+				}
+				
+				stvec.resize(new_total_rows);
+			});		
+	}
+	
+	//*************************************************************************************	
+		
 	void delete_empty_values(const std::string& colname)
 	{
 		std::vector<int> to_be_deleted(get_total_rows_count(), 0);
@@ -158,33 +185,46 @@ class TableHolderClass
 						   return st.compare("") == 0;
 					   });
 	
-		unsigned int n_deleted = std::accumulate(to_be_deleted.begin(), to_be_deleted.end(), 0);
-		BenchmarkSingleton::Instance().Message("Deleting " + std::to_string(n_deleted) + " empty rows for column " + colname);
-		unsigned int new_total_rows = get_total_rows_count() - n_deleted;
-			
-		std::for_each(StringTableContainer.begin(), StringTableContainer.end(), [&](std::vector<std::string>& stvec)
-			{
-				auto it = to_be_deleted.begin();
-				auto sit = stvec.begin();
-				auto tit = stvec.begin();
-				
-				for (; it != to_be_deleted.end(); ++it, ++sit)
-				{
-					*tit = *sit;
-					if (! (*it)) ++tit;
-				}
-				
-				stvec.resize(new_total_rows);
-			});		
+		BenchmarkSingleton::Instance().Message("Deleting empty rows for column " + colname);
+	
+		delete_rows_by_label(to_be_deleted.begin(), to_be_deleted.end());
 	}	
+	
+	//*************************************************************************************	
+	
+	void delete_noise_rows()
+	{
+		std::vector<int> to_be_deleted(get_total_rows_count(), 0);
+		
+		// searches for "" to mark row as deletable
+		auto whichcol_it = std::find(Col_Names.begin(), Col_Names.end(), "clone_id");
+		unsigned int pos = whichcol_it - Col_Names.begin();
+		
+		std::transform(StringTableContainer[pos].begin(), 
+					   StringTableContainer[pos].end(),
+					   to_be_deleted.begin(),
+					   [&](const std::string& st) {
+						   return st.compare("0") == 0;
+					   });
+	
+		BenchmarkSingleton::Instance().Message("Deleting noise points");
+		delete_rows_by_label(to_be_deleted.begin(), to_be_deleted.end());
+	}	
+	
 	
 	//*************************************************************************************	
 	
 	void write_to_file()
 	{
-		char wsep = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsInput, ConfigHolderClass::separator);
-		char wendline = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsInput, ConfigHolderClass::endline);
-		char wquotation = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsInput, ConfigHolderClass::quotation);
+		char wsep = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsOutput, ConfigHolderClass::separator);
+		char wendline = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsOutput, ConfigHolderClass::endline);
+		char wquotation = ConfigHolder.getSpecialCharacter(ConfigHolderClass::fsOutput, ConfigHolderClass::quotation);
+		
+		// do we need to remove noise?
+		if (ConfigHolder.remove_noise_from_output())
+		{
+			delete_noise_rows();
+		}
 		
 		// the output columns that are not available are added as empty columns
 		
@@ -300,9 +340,9 @@ class TableHolderClass
 		InterlinkClass Interlink(InputIterators, get_total_rows_count(), 
 			v_gene_names.begin(), v_gene_names.size(),
 			j_gene_names.begin(), j_gene_names.size(),
-			ConfigHolder.get_DBSCAN_threshold(), ConfigHolder.get_DBSCAN_minPts());
+			ConfigHolder.get_DBSCAN_threshold(), ConfigHolder.get_DBSCAN_minPts(), ConfigHolder.is_set_only_hamming(), ConfigHolder.get_tree_depth_statistics());
 		
-		append_column("cloned_id", Interlink.get_clusters_iterator(), Interlink.get_clusters_iterator() + get_total_rows_count());
+		append_column("clone_id", Interlink.get_clusters_iterator(), Interlink.get_clusters_iterator() + get_total_rows_count());
 		append_column("copies", Interlink.get_copies_iterator(), Interlink.get_copies_iterator() + get_total_rows_count());
 		append_column("cores", Interlink.get_cores_iterator(), Interlink.get_cores_iterator() + get_total_rows_count() );
 	}
