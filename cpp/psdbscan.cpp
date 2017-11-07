@@ -76,7 +76,9 @@ int main(int argc, char** argv)
 	
 	ConfigHolderClass ConfigHolder(conf_filename);
 	
-	std::for_each(input_filenames.begin(), input_filenames.end(), [&](const std::string& inp_name) { BenchmarkSingleton::Instance().Message("Input file(s) " + inp_name); });
+	std::for_each(input_filenames.begin(), input_filenames.end(), [&](const std::string& inp_name) { 
+		BenchmarkSingleton::Instance().Message("Input file(s) " + inp_name); 
+	});
 	
 	BenchmarkSingleton::Instance().Message("Using configuration file " + conf_filename);
 		
