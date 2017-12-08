@@ -99,7 +99,7 @@ int main(int argc, char** argv)
 	BenchmarkSingleton::Instance().StartTimer("Writing Output");
 	std::cout << "\nFinished!\n\n";
 	BenchmarkSingleton::Instance().StopTimer("Overall");
-	std::cout << "***************************************************************************************************\n";
+	std::cout << "\n\n***************************************************************************************************\n";
 	BenchmarkSingleton::Instance().write_map(ConfigHolder.create_filename(input_filenames[0], ConfigHolderClass::fsBenchmark));
 	
 	return 0;	

@@ -40,6 +40,7 @@
 #include <thrust/reduce.h> 
 #include <thrust/transform.h> 
 #include <thrust/replace.h> 
+#include <thrust/count.h> 
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/permutation_iterator.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -118,22 +119,6 @@ void set_new_root_only_if_not_defined_before(root_iterator_type roots_iter, unsi
 	root_value_type *ptr = thrust::raw_pointer_cast(& (* (roots_iter + entry)));
 	
 	atomicCAS(ptr, entry, new_root);
-}
-
-//*********************************************************************************************************
-// this function calculates a position in the upper triangle of a matrix ... for later uses
-
-__device__ int int_sqrt(int x)
-{
-	return truncf(__frsqrt_rn(x));
-}
-
-__device__ 
-thrust::pair<int,int> calc_triangle_position(int position)
-{
-	int i = (int_sqrt(8*position) + 1)/2;
-	int j = position - (i*(i-1))/2;
-	return thrust::make_pair(i,j);
 }
 
 
@@ -304,6 +289,62 @@ improved_levenshtein_distance(char* subjstring, unsigned int subj_len, char* que
 	return shared_memory_block[ij_to_address(subj_len, query_len, width)];  
 }
 
+//****************************************************************************************** 
+// this is a variation of the above function. It is able to cope with a 2D kernel.
+// The problem is the syncing of threads, because the stringlengths are different.
+// We therefore use a standard maximum length "max_strlen"
+
+__device__
+int
+improved_levenshtein_distance(char* subjstring, unsigned int subj_len, char* querystring, unsigned int query_len, unsigned int max_strlen, int* shared_memory_block)
+{
+	int width = 2 + max_strlen;
+	int result;
+	
+	for (int n = threadIdx.x; n < 2*width; n+=blockDim.x) shared_memory_block[n] = 0;
+	
+	//for (int dx = 0; dx < query_len + subj_len + 1; ++dx)
+	for (int dx = 0; dx < 2*max_strlen + 1; ++dx)
+    {
+		//???????????????????
+		
+		int initval = (dx == 0)? 0 : dx;
+        
+	    for (int index = threadIdx.x; index <  width; index += blockDim.x)
+	    {
+			int ix = diag_to_i(dx, index, width);
+			int jx = diag_to_j(dx, index, width);
+            
+			if (ix >= 0 && ix <= subj_len && jx >= 0 && jx <= query_len)
+	        {
+				int ma = diag_to_address(dx, index, width);
+				if (ix == 0 || jx == 0)
+				{
+					shared_memory_block[ma] = initval;
+				} 
+				else 
+				{
+					int ma11 = ij_to_address(ix-1, jx-1, width);
+					int ma01 = ij_to_address(ix, jx-1, width);
+					int ma10 = ij_to_address(ix-1, jx, width);
+          				
+					int val11 = shared_memory_block[ma11];
+					if (subjstring[ix-1] != querystring[jx-1]) val11 += 1;
+          
+					int val01 = shared_memory_block[ma01] + 1;
+					int val10 = shared_memory_block[ma10] + 1;
+          
+					shared_memory_block[ma] = min(min(val11, val01), val10);
+				}
+			}
+		}
+		__syncthreads();
+	}
+  
+	return shared_memory_block[ij_to_address(subj_len, query_len, width)];  
+}
+
+
 
  
 //****************************************************************************************** 
@@ -453,205 +494,6 @@ int bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitv
 
 
 
-//*********************************************************************************************************
-// these functions are working within a single thread to allow optimal usage of the GPU
-
-
-
-// Version 1
-template <int sN, class iterator_tuple_type, typename max_width_tuple_type> 
-__device__ 
-bool singlet_bitset_values_equal (iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
-{
-	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
-	
-	typedef Int2Type<sN - 1> mapType;
-	mapType mapInt;
-	
-	
-	bool result = singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
-	bool cmp = result;
-	
-	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
-	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
-	
-	int position = 0; 
-	while (position < current_width && cmp)
-	{
-		cmp = (pointer1[position] == pointer2[position]);
-		++position;
-	}
-	return cmp;
-}	
-
-	
-// Version 2	
-template <class iterator_tuple_type, typename max_width_tuple_type> 
-__device__ 
-bool singlet_bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
-{
-	unsigned int current_width = thrust::get<0>(gene_width_tuple);
-	
-	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
-	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
-	
-	bool cmp = true;
-	int position = 0; 
-	while (position < current_width && cmp)
-	{
-		cmp = (pointer1[position] == pointer2[position]);
-		++position;
-	}
-	return cmp;
-}	
-
-
-
-// BaseCaller
-template <class iterator_tuple_type, typename max_width_tuple_type> 
-__device__ 
-bool singlet_bitset_values_equal(iterator_tuple_type bitvalues1, iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
-{
-	typedef Int2Type<thrust::tuple_size<typename iterator_tuple_type::value_type>::value-1> mapType;
-	mapType map;
-	
-	return singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, map);
-}
-
-
-
-//************************************************************************************************************************
-	// Version 1
-	template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
-	{
-		unsigned int current_width = thrust::get<sN>(gene_width_tuple);
-		
-		typedef Int2Type<sN - 1> mapType;
-		mapType mapInt;
-		
-		int cmp = 0;
-		int result = compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
-		
-		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
-		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
-		
-		for (int position = 0; position < current_width; ++position)
-		{
-			cmp |= (pointer1[position] & pointer2[position]);
-		}
-		
-		result = result && cmp;
-		
-		return result;
-	}	
-		
-	// Version 2	
-	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
-	{
-		unsigned int current_width = thrust::get<0>(gene_width_tuple);
-		
-		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
-		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
-		
-		int cmp = 0;
-		for (int position = 0; position < current_width; ++position)
-		{
-			cmp |= (pointer1[position] & pointer2[position]);
-		}
-		
-		return cmp;
-	}	
-	
-	
-	// BaseCaller
-	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
-	{
-		static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
-		typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
-		mapType map;
-		
-		return singlet_compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, map);
-	}
-	
-	
-
-
-
-//*********************************************************************************************************
-// this kernel does an exact match comparison
-// it contains a lot of branches, which are actually on block level and not thread level. So this should
-// not reduce performance too much
-
-template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type, typename root_iterator_type>
-__global__
-void 
-find_duplicates_kernel(bitset_iterator_type bitset_iterator, 
-					   bitset_properties_type bitset_properties, 
-                       stringset_iterator_type stringset_iterator, 
-                       root_iterator_type roots_iterator, 
-                       unsigned n_points)
-{
-	
-	// first, do the grid stride loop
-	for (unsigned query_index = blockIdx.x; query_index < n_points; query_index += gridDim.x)
-	{
-		for (unsigned subj_index = blockIdx.y; subj_index < n_points; subj_index += gridDim.y)
-		{
-			// now we're in business
-			if (query_index < subj_index)  // avoid duplicate comparisons and comparisons with itself
-			{
-				if (thrust::get<2>(*(stringset_iterator + query_index)) == thrust::get<2>(*(stringset_iterator + subj_index)))  // if string hashes are identical
-				{
-					unsigned int query_len = thrust::get<1>(*(stringset_iterator + query_index));
-					unsigned int subj_len  = thrust::get<1>(*(stringset_iterator + subj_index));
-					if (query_len == subj_len) // and if string lengths are identical
-					{
-						int neqsum = 0;
-						char *query_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + query_index)) );
-						char  *subj_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + subj_index)) );
-						
-						int neq = 0;
-						
-						for (unsigned int tx = threadIdx.x; tx < query_len; tx += blockDim.x)
-						{	
-							if (query_string_ptr[tx] != subj_string_ptr[tx]) ++neq;
-						}
-						
-						neqsum = __syncthreads_count(neq);  // the exact number is not so important ... 
-						
-						if ( neqsum == 0 )   // and if strings are still identical
-						{
-							// now compare the bitsets
-							int still_equal = bitset_values_equal(bitset_iterator + query_index, bitset_iterator + subj_index, bitset_properties);
-							__syncthreads();
-							
-							if (still_equal && threadIdx.x == 0)  // this is just done by the first thread
-							{
-								// search for root of query
-								
-								//unsigned int root_query = find_root(roots_iterator, query_index);
-								//unsigned int q_point = *(roots_iterator+query_index);
-								//printf("The root of %u points to %u with %u as root\n", query_index,q_point, root_query);
-								// printf("Want to connect %u with root %u of %u \n", subj_index, root_query, query_index);
-								
-								// set_new_root(roots_iterator, subj_index, query_index);
-								union_a_and_b(roots_iterator, subj_index, query_index);
-							}
-						}
-					}
-				} // if
-			} // if
-		} // for
-	} // for
-}
-
-
 //**********
 
 template <typename bitset_iterator_type, typename bitset_properties_type, typename result_iterator_type>
@@ -756,11 +598,9 @@ half_hamming_core_points( bitset_iterator_type bitset_iterator,
 				  distance_functor_type distance_functor,
 				  unsigned int minPts)
 {
-	extern __shared__ int cs[];
-	// first, do the grid stride loop
-	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	for (unsigned int x_preindex = blockIdx.x*blockDim.x + threadIdx.x; x_preindex < n_points; x_preindex += blockDim.x * gridDim.x)
 	{
-		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		for (unsigned int y_preindex = blockIdx.y*blockDim.y + threadIdx.y; y_preindex < n_points; y_preindex += blockDim.y * gridDim.y)
 		{
 			unsigned int x_index = *(unique_indices_iterator + x_preindex);
 			unsigned int y_index = *(unique_indices_iterator + y_preindex);
@@ -771,42 +611,47 @@ half_hamming_core_points( bitset_iterator_type bitset_iterator,
 					y_len = thrust::get<1>(*(stringset_iterator + y_index));
 						 
 				int schwelle = distance_functor(x_len, y_len);
-												
-				int result = 0;
 			
 				if (x_len == y_len)
 				{
-					if (compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
+					
+					if (singlet_compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
 					{
-						char* x_string  = (char*)cs;
-						char* y_string = &x_string[max_strlen];
+						char *x_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + x_index)) );
+						char *y_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + y_index)) );
+							
+						int hamming_dist = 0;
+					
+						bool result = true;
+						unsigned int position = 0; 						
 						
-						strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
-						strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
+						while (position < x_len && result)
+						{
+							if (x_string_ptr[position] != y_string_ptr[position]) 
+							{
+								++hamming_dist;
+								result = hamming_dist <= schwelle;
+							}
+							++position;
+						}
+							
+						if (result)
+						{
+							static_assert(std::is_same<typename core_point_iterator_type::value_type, typename copies_iterator_type::value_type>::value, "Core and copies iterator value types are not identical!");
 					
-						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
-						
-						// the sync_threads part is not critical here, because everything is happening within a block
-					}					
-				}
-								
-				if (threadIdx.x == 0 && result) 
-				{
-					static_assert(std::is_same<typename core_point_iterator_type::value_type, typename copies_iterator_type::value_type>::value, "Core and copies iterator value types are not identical!");
+							typename core_point_iterator_type::value_type *core_at_x = thrust::raw_pointer_cast(&  (*(core_point_iterator + x_index)));
+							typename core_point_iterator_type::value_type *core_at_y = thrust::raw_pointer_cast(&  (*(core_point_iterator + y_index)));
 					
-					typename core_point_iterator_type::value_type *core_at_x = thrust::raw_pointer_cast(&  (*(core_point_iterator + x_index)));
-					typename core_point_iterator_type::value_type *core_at_y = thrust::raw_pointer_cast(&  (*(core_point_iterator + y_index)));
-					
-					typename copies_iterator_type::value_type x_copies = *(copies_iterator + x_index);
-					typename copies_iterator_type::value_type y_copies = *(copies_iterator + y_index);
-					
-					atomicAdd(core_at_x, y_copies);
-					
-					atomicAdd(core_at_y, x_copies);						
-					
-				} // if (threadIdx.x == 0 && result) 			
-			}
-			
+							typename copies_iterator_type::value_type x_copies = *(copies_iterator + x_index);
+							typename copies_iterator_type::value_type y_copies = *(copies_iterator + y_index);
+							
+							atomicAdd(core_at_x, y_copies);
+							
+							atomicAdd(core_at_y, x_copies);					
+						} // if (result)
+					}
+				}	
+			}			
 		} // for 
 	} // for	
 }
@@ -828,64 +673,69 @@ fuse_hamming_clusters( bitset_iterator_type bitset_iterator,
 					    core_point_iterator_type core_point_iterator,
 					    core_point_indices_iterator_type core_point_indices_iterator,
 					    unique_indices_iterator_type unique_indices_iterator,
-					    unsigned int n_points,
+					    unsigned int n_cores,
+					    unsigned int n_uniques,
 					    unsigned int max_strlen,
 					    distance_functor_type distance_functor)
 {
-	extern __shared__ int cs[];
-	// first, do the grid stride loop
-	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	// were working with singlet kernels
+	
+	for (unsigned int x_preindex = blockIdx.x*blockDim.x + threadIdx.x; x_preindex < n_cores; x_preindex += blockDim.x * gridDim.x)
 	{
-		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		for (unsigned int y_preindex = blockIdx.y*blockDim.y + threadIdx.y; y_preindex < n_uniques; y_preindex += blockDim.y * gridDim.y)
 		{
 			unsigned int x_index = *(core_point_indices_iterator + x_preindex);
 			unsigned int y_index = *(unique_indices_iterator + y_preindex);
 			
-			if (x_index < y_index)
+			if (x_index < y_index ||  !(*(core_point_iterator + y_index)))
 			{
 				int x_len = thrust::get<1>(*(stringset_iterator + x_index)),
 					y_len = thrust::get<1>(*(stringset_iterator + y_index));
 						 
 				int schwelle = distance_functor(x_len, y_len);
 												
-				int result = 0;
-			
 				if (x_len == y_len)
 				{
-					if (compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
+					
+					if (singlet_compare_bitset_values(bitset_iterator + x_index, bitset_iterator + y_index, bitset_properties))
 					{
-						char* x_string  = (char*)cs;
-						char* y_string = &x_string[max_strlen];
+						char *x_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + x_index)) );
+						char *y_string_ptr = thrust::raw_pointer_cast(& thrust::get<0>(*(stringset_iterator + y_index)) );
+							
+						int hamming_dist = 0;
+					
+						bool result = true;
+						unsigned int position = 0;
 						
-						strided_copy_global_to_shared_string(stringset_iterator + x_index, x_string);
-						strided_copy_global_to_shared_string(stringset_iterator + y_index, y_string);
-					
-						result = improved_hamming_distance(x_string, x_len, y_string, y_len) <= schwelle;
-						
-						// the sync_threads part is not critical here, because everything is happening within a block
-					}					
-				}
-				
-				if (threadIdx.x == 0 && result) {
-					// x will be the master
-					unsigned int x_root = x_index; // find_root(roots_iterator, x_index);
-					
-					// y will be the slave
-					int is_y_core = *(core_point_iterator + y_index);
-					
-					if (is_y_core)
-					{
-						// find root of y and attach it to x_root
-						// set_new_root(roots_iterator, y_index, x_root);
-						union_a_and_b(roots_iterator, y_index, x_root);
+						while (position < x_len && result)
+						{
+							if (x_string_ptr[position] != y_string_ptr[position]) ++hamming_dist;
+							result = hamming_dist <= schwelle;
+							++position;
+						}
+							
+						if (result)
+						{
+							// x will be the master
+							unsigned int x_root = x_index; // find_root(roots_iterator, x_index);
+							
+							// y will be the slave
+							int is_y_core = *(core_point_iterator + y_index);
+							
+							if (is_y_core)
+							{
+								// find root of y and attach it to x_root
+								// set_new_root(roots_iterator, y_index, x_root);
+								union_a_and_b(roots_iterator, y_index, x_root);
+							}
+							else // y is not a core point and will be bound only once!
+							{
+								set_new_root_only_if_not_defined_before(roots_iterator, y_index, x_root);
+							}
+							
+						} // if (result)
 					}
-					else // y is not a core point and will be bound only once!
-					{
-						set_new_root_only_if_not_defined_before(roots_iterator, y_index, x_root);
-					}
-					
-				} // if (threadIdx.x == 0 && result) 
-			
+				}					
 			} // if (x_index < y_index)
 		} // for 
 	} // for	
@@ -895,6 +745,7 @@ fuse_hamming_clusters( bitset_iterator_type bitset_iterator,
 //*********************************************************************************************************
 //*********************************************************************************************************
 // This kernel is an alternate version to identify core points
+
 
 
 template <typename bitset_iterator_type, typename bitset_properties_type, typename stringset_iterator_type,
@@ -908,16 +759,16 @@ half_core_points( bitset_iterator_type bitset_iterator,
 				  unique_indices_iterator_type unique_indices_iterator,
 				  copies_iterator_type copies_iterator,
 				  core_point_iterator_type core_point_iterator,			      
-				  unsigned int n_points,
+				  unsigned int n_uniques,
 				  unsigned int max_strlen,
 				  distance_functor_type distance_functor,
 				  unsigned int minPts)
 {
 	extern __shared__ int cs[];
 	// first, do the grid stride loop
-	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_uniques; x_preindex += gridDim.x)
 	{
-		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_uniques; y_preindex += gridDim.y)
 		{
 			unsigned int x_index = *(unique_indices_iterator + x_preindex);
 			unsigned int y_index = *(unique_indices_iterator + y_preindex);
@@ -982,6 +833,7 @@ half_core_points( bitset_iterator_type bitset_iterator,
 }
 
 
+
 //*********************************************************************************************************
 // this kernel is fuses the data
 
@@ -997,20 +849,21 @@ fuse_clusters( bitset_iterator_type bitset_iterator,
 					    core_point_iterator_type core_point_iterator,
 					    core_point_indices_iterator_type core_point_indices_iterator,
 					    unique_indices_iterator_type unique_indices_iterator,
-					    unsigned int n_points,
+					    unsigned int n_cores,
+					    unsigned int n_unique,
 					    unsigned int max_strlen,
 					    distance_functor_type distance_functor)
 {
 	extern __shared__ int cs[];
 	// first, do the grid stride loop
-	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_points; x_preindex += gridDim.x)
+	for (unsigned int x_preindex = blockIdx.x; x_preindex < n_cores; x_preindex += gridDim.x)
 	{
-		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_points; y_preindex += gridDim.y)
+		for (unsigned int y_preindex = blockIdx.y; y_preindex < n_unique; y_preindex += gridDim.y)
 		{
 			unsigned int x_index = *(core_point_indices_iterator + x_preindex);
 			unsigned int y_index = *(unique_indices_iterator + y_preindex);
 			
-			if (x_index < y_index)
+			if (x_index < y_index || !(*(core_point_iterator + y_index)))
 			{
 								
 				// will proceed only, when x is a core point! 
@@ -1173,8 +1026,9 @@ class DBSCAN
 		blocks = ((blocks + max_threads - 1)/max_threads) * max_threads;
 		
 		// 
-		thrust::device_vector<unsigned int> depth_vector(21,0);
-		unsigned int maxdepth = 20;
+		unsigned int maxdepth = 50;
+		thrust::device_vector<unsigned int> depth_vector(maxdepth+1,0);
+		
 				
 		tree_depth_evaluation_kernel<<<blocks, max_threads>>>(roots.begin(), depth_vector.begin(), n_points, maxdepth);
 		
@@ -1210,6 +1064,9 @@ class DBSCAN
 		
 		dim3 block_layout(xthreads, ythreads, 1);
 		dim3 grid_layout(xblocks, yblocks, 1);
+		
+		BenchmarkSingleton::Instance().Message("Dispatching Kernel for finding duplicates with a " + std::to_string(xblocks) + "x" + std::to_string(yblocks) + 
+			" grid that holds " + std::to_string(xthreads) + "x" + std::to_string(ythreads) + " threads");
 	
 		singlet_find_duplicates_kernel<<<grid_layout, block_layout>>>(DataManager.get_bitset_begin(), DataManager.get_bitset_properties(), DataManager.get_StringDataIterator(), roots.begin(), n_points);
 	}
@@ -1271,8 +1128,25 @@ class DBSCAN
 			
 			
 		if (pure_hamming_approach)
-		{
-			half_hamming_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
+		{	
+			unsigned int ythreads = max_threads / 32;
+			ythreads = (ythreads > max_threads_dim[1])? max_threads_dim[1] : ythreads;
+			unsigned int xthreads = max_threads / ythreads;
+			xthreads = (xthreads > max_threads_dim[0])? max_threads_dim[0] : xthreads;
+	    
+			xblocks = (n_unique + xthreads - 1)/xthreads;
+			xblocks = (xblocks < max_blocks[0])? xblocks : (max_blocks[0]);
+				
+			yblocks = (n_unique + ythreads - 1)/ythreads;
+			yblocks = (yblocks < max_blocks[1])? yblocks : (max_blocks[1]);
+		
+			dim3 ham_block_layout(xthreads, ythreads, 1);
+			dim3 ham_grid_layout(xblocks, yblocks, 1);
+							
+			BenchmarkSingleton::Instance().Message("Dispatching Kernel for finding cores with a " + std::to_string(xblocks) + "x" + std::to_string(yblocks) + 
+			" grid that holds " + std::to_string(xthreads) + "x" + std::to_string(ythreads) + " threads");
+			
+			half_hamming_core_points<<<ham_grid_layout, ham_block_layout>>>( 
 				  DataManager.get_bitset_begin(), 
 				  DataManager.get_bitset_properties(), 
 				  DataManager.get_StringDataIterator(),
@@ -1285,6 +1159,11 @@ class DBSCAN
 				  minPts);
 		} else 
 		{
+			
+			BenchmarkSingleton::Instance().Message("Dispatching Kernel for finding cores with a " + std::to_string(xblocks) + "x" + std::to_string(yblocks) + 
+			" grid that holds one dimension of " + std::to_string(nthreads) + " threads");
+	
+			
 			half_core_points<<<grid_layout, nthreads, shared_memory_usage>>>( 
 					  DataManager.get_bitset_begin(), 
 					  DataManager.get_bitset_properties(), 
@@ -1334,7 +1213,22 @@ class DBSCAN
 		
 		if (pure_hamming_approach)
 		{
-			fuse_hamming_clusters<<<grid_layout, nthreads, shared_memory_usage>>>( 
+			
+			unsigned int ythreads = max_threads / 32;
+			ythreads = (ythreads > max_threads_dim[1])? max_threads_dim[1] : ythreads;
+			unsigned int xthreads = max_threads / ythreads;
+			xthreads = (xthreads > max_threads_dim[0])? max_threads_dim[0] : xthreads;
+	    
+			xblocks = (n_core_points + xthreads - 1)/xthreads;
+			xblocks = (xblocks < max_blocks[0])? xblocks : (max_blocks[0]);
+				
+			yblocks = (n_unique + ythreads - 1)/ythreads;
+			yblocks = (yblocks < max_blocks[1])? yblocks : (max_blocks[1]);
+		
+			dim3 ham_block_layout(xthreads, ythreads, 1);
+			dim3 ham_grid_layout(xblocks, yblocks, 1);
+			
+			fuse_hamming_clusters<<<ham_grid_layout, ham_block_layout>>>( 
 						DataManager.get_bitset_begin(), 
 						DataManager.get_bitset_properties(), 
 					    DataManager.get_StringDataIterator(),
@@ -1342,6 +1236,7 @@ class DBSCAN
 					    is_core_point_vector.begin(),
 					    core_point_indices.begin(),
 					    uniques.begin(),
+					    n_core_points,
 					    n_unique,
 					    stringlength,
 					    distanceFunctor);
@@ -1355,6 +1250,7 @@ class DBSCAN
 						    is_core_point_vector.begin(),
 						    core_point_indices.begin(),
 						    uniques.begin(),
+						    n_core_points,
 						    n_unique,
 						    stringlength,
 						    distanceFunctor);
@@ -1388,6 +1284,13 @@ class DBSCAN
 		thrust::scatter(thrust::device, counter_iter, counter_iter + intermediate.size(), intermediate.begin(), intermediate3.begin());
 		
 		thrust::gather(thrust::device, roots.begin(), roots.end(), intermediate3.begin(), cluster_ids.begin());
+		
+		// determine number of noise points
+		unsigned int n_noise = thrust::count(thrust::device, cluster_ids.begin(), cluster_ids.end(), 0);
+		BenchmarkSingleton::Instance().Message("Number of noise points = " + std::to_string(n_noise));
+		unsigned int perc_noise = (100*n_noise)/DataManager.get_n_entries();
+		BenchmarkSingleton::Instance().Message("Percentage of noise points = " + std::to_string(perc_noise) + "%");	
+		
 	}
 	
 	

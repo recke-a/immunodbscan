@@ -69,6 +69,15 @@ class CSVReaderClass
 	}
 			
 	//*************************************************************************************	
+	
+	void purify_line(std::string& line)
+	{
+		if ( line.size() && line[line.size()-1] == '\r' ) 
+		{
+           line = line.substr( 0, line.size() - 1 );
+       }
+	}
+	
 	//*************************************************************************************
 			
 	public:
@@ -94,6 +103,7 @@ class CSVReaderClass
 	{
 		std::string line;
         std::getline(file, line, file.widen(endline));
+        purify_line(line);
         
         boost::tokenizer<boost::escaped_list_separator<char> > tk(line, boost::escaped_list_separator<char>('\\', separator, quotation));
         
@@ -112,7 +122,12 @@ class CSVReaderClass
 			auto pos = std::find(headerline.begin(), headerline.end(), *it); 
 			
 			// exit with noise, if the selected header is not found
-			if (pos == headerline.end()) throw std::runtime_error("Required column " + (*it) + " not found in " + filename);
+			if (pos == headerline.end()) {
+				std::cout << "\nError while checking table headers. Column \"" << (*it) << "\" was not found. These headers are available: \n***\n";
+				std::for_each(headerline.begin(), headerline.end(), [&](const std::string& hl) { std::cout << "Länge = " << hl.size() << " \"" << hl << "\"\n"; });
+				std::cout << "***\n"; std::cout.flush();
+				throw std::runtime_error("Required column " + (*it) + " not found in " + filename);
+			}
 			
 			// change into an index
 			int ind_pos = pos - headerline.begin();
@@ -127,7 +142,7 @@ class CSVReaderClass
 	template <typename col_iterator_type>
 	void read_full_file(col_iterator_type col_iterator_begin, col_iterator_type col_iterator_end)
 	{
-		const unsigned int BLOCK_SIZE = 1000;
+		const unsigned int BLOCK_SIZE = 10000;
 	
 		std::string line;
 		
@@ -147,6 +162,7 @@ class CSVReaderClass
 			for (unsigned int fut_i = 0; fut_i < BLOCK_SIZE && !file.eof(); ++fut_i, ++line_number)
 			{
 				std::getline(file, line, file.widen(endline));
+				purify_line(line);
 				
 				// spawn tasks
 				tasklist.push_back( std::async( std::launch::async,

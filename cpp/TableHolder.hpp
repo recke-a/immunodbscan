@@ -324,7 +324,7 @@ class TableHolderClass
 		thrust::host_vector<std::string> sequence_strings;
 	
 		if (sequence_colname.compare("") == 0) {
-			sequence_strings.assign(get_total_rows_count(), "V");  // otherwise, I get strange warnings
+			sequence_strings.assign(get_total_rows_count(), "Gene");  // otherwise, I get strange warnings
 		}
 		else
 		{

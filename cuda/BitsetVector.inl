@@ -210,63 +210,200 @@ void bitset_container::walk_queries(
 
 
 //************************************************************************************************************************
-	// Version 1
-	template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
-	{
-		unsigned int current_width = thrust::get<sN>(gene_width_tuple);
-		
-		typedef Int2Type<sN - 1> mapType;
-		mapType mapInt;
-		
-		int cmp = 0;
-		int result = compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
-		
-		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
-		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
-		
-		for (int position = threadIdx.x; position < current_width; position += blockDim.x)
-		{
-			cmp |= (pointer1[position] & pointer2[position]);
-		}
-		
-		result = result && (__syncthreads_count(cmp) > 0);
-		
-		return result;
-	}	
-		
-	// Version 2	
-	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
-	{
-		unsigned int current_width = thrust::get<0>(gene_width_tuple);
-		
-		int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
-		int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
-		
-		int cmp = 0;
-		for (int position = threadIdx.x; position < current_width; position += blockDim.x)
-		{
-			cmp |= (pointer1[position] & pointer2[position]);
-		}
-		
-		return (__syncthreads_count(cmp) > 0);
-	}	
+// Version 1
+template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+{
+	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
 	
+	typedef Int2Type<sN - 1> mapType;
+	mapType mapInt;
 	
-	// BaseCaller
-	template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
-	__device__ 
-	int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+	int cmp = 0;
+	int result = compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+	
+	for (int position = threadIdx.x; position < current_width; position += blockDim.x)
 	{
-		static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
-		typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
-		mapType map;
-		
-		return compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, map);
+		cmp = cmp | (pointer1[position] & pointer2[position]);
 	}
+	
+	result = result && (__syncthreads_count(cmp) > 0);
+	
+	return result;
+}	
+	
+//************************************************************************************************************************
+// single threaded version
+// Version 1
+template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal (first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+{
+	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
+	
+	typedef Int2Type<sN - 1> mapType;
+	mapType mapInt;
+	
+	
+	bool result = singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+	bool cmp = result;
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+	
+	int position = 0; 
+	while (position < current_width && cmp)
+	{
+		cmp = (pointer1[position] == pointer2[position]);
+		++position;
+	}
+	return cmp;
+}	
+
+
+//************************************************************************************************************************
+// Version 1
+template <int sN, class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<sN>)
+{
+	unsigned int current_width = thrust::get<sN>(gene_width_tuple);
+	
+	typedef Int2Type<sN - 1> mapType;
+	mapType mapInt;
+	
+	int result = singlet_compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, mapInt);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<sN>(*bitvalues2)) );
+	
+	int cmp = 0;
+	for (int position = 0; position < current_width; ++position)
+	{
+		cmp = cmp | (pointer1[position] & pointer2[position]);
+	}
+	
+	result = result && cmp;
+	
+	return result;
+}	
+	
+		
+//******************************************************************************************
+// Version 2	
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+{
+	unsigned int current_width = thrust::get<0>(gene_width_tuple);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+	
+	int cmp = 0;
+	for (int position = threadIdx.x; position < current_width; position += blockDim.x)
+	{
+		cmp = cmp | (pointer1[position] & pointer2[position]);
+	}
+	
+	return (__syncthreads_count(cmp) > 0);
+}	
+
+// Version 2	
+//******************************************************************************************
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+{
+	unsigned int current_width = thrust::get<0>(gene_width_tuple);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+	
+	int cmp = 0;
+	for (int position = 0; position < current_width; ++position)
+	{
+		cmp = cmp | (pointer1[position] & pointer2[position]);
+	}
+	
+	return cmp;		
+}	
+	
+
+//******************************************************************************************
+// single thread version 
+// Version 2	
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple, Int2Type<0>)
+{
+	unsigned int current_width = thrust::get<0>(gene_width_tuple);
+	
+	int *pointer1 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues1)) );
+	int *pointer2 = thrust::raw_pointer_cast( & (thrust::get<0>(*bitvalues2)) );
+	
+	bool cmp = true;
+	int position = 0; 
+	while (position < current_width && cmp)
+	{
+		cmp = (pointer1[position] == pointer2[position]);
+		++position;
+	}
+	return cmp;
+}	
+	
+	
+//******************************************************************************************
+// BaseCaller
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+{
+	static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
+	typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
+	mapType map;
+	
+	return compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, map);
+}
+
+//******************************************************************************************
+// BaseCaller
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+int singlet_compare_bitset_values(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+{
+	static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
+	typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
+	mapType map;
+	
+	return singlet_compare_bitset_values(bitvalues1, bitvalues2, gene_width_tuple, map);
+}
+
+
+//******************************************************************************************
+// single thread version BaseCaller
+template <class first_iterator_tuple_type, class second_iterator_tuple_type, typename max_width_tuple_type> 
+__device__ 
+bool singlet_bitset_values_equal(first_iterator_tuple_type bitvalues1, second_iterator_tuple_type bitvalues2, max_width_tuple_type gene_width_tuple)
+{
+	static_assert(std::is_same<typename first_iterator_tuple_type::value_type, typename second_iterator_tuple_type::value_type>::value == true, "First and seoncd iterator value types must be equal");
+	typedef Int2Type<thrust::tuple_size<typename first_iterator_tuple_type::value_type>::value-1> mapType;
+	mapType map;
+
+	return singlet_bitset_values_equal(bitvalues1, bitvalues2, gene_width_tuple, map);
+}
+
+	
+
+//*********************************************************************************************************
+// these functions are working within a single thread to allow optimal usage of the GPU
+
+
+	
 	
 	
 
